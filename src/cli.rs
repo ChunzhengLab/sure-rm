@@ -108,7 +108,7 @@ pub fn parse_args() -> Result<Command, String> {
 
 pub fn usage() -> &'static str {
     "\
-sure-rm 0.1.0
+sure-rm 0.2.0
 
 Usage:
   sure-rm [OPTIONS] <PATH>...
