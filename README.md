@@ -1,5 +1,7 @@
 # sure-rm
 
+[中文](README.zh-cn.md)
+
 `sure-rm` is a safer `rm`-style tool written in Rust. It defaults to moving paths into a recoverable trash store instead of hard-deleting them.
 
 This project is intentionally not a bit-for-bit clone of system `rm`. The interface is familiar, but the default behavior is safer.
