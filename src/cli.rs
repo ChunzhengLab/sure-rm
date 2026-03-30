@@ -148,7 +148,7 @@ pub fn parse_args() -> Result<Command, String> {
 
 pub fn usage() -> &'static str {
     "\
-sure-rm 0.2.2
+sure-rm 0.2.4
 A safer rm that moves files to trash instead of deleting them.
 Use -s/--sure to bypass and exec the system rm.
 
