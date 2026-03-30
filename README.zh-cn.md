@@ -15,13 +15,29 @@ brew install sure-rm
 
 详见 [homebrew-tap](https://github.com/ChunzhengLab/homebrew-tap)。
 
+## 模式
+
+`--mode` 和 `SURE_RM_MODE` 支持以下取值：
+
+- `auto`：根据 TTY 情况自动判断
+- `interactive`：对风险较高的操作默认增加一次确认
+- `batch`：不额外增加隐式确认
+
+`interactive` 模式适合配合 shell alias 使用，例如：
+
+```sh
+alias rm='sure-rm --mode interactive'
+```
+
+在这种配置下，`rm -s ...`（或 `rm --sure ...`）可以作为回退到系统原生命令的显式开关。
+
 ## 功能
 
 - 提供更安全的 `rm` 式删除，适用于文件、符号链接和目录
 - 提供 `list`、`restore` 和 `purge` 三个子命令
 - 支持 `-d`、`-f`、`-i`、`-I`、`-P`、`-r/-R`、`-v`、`-W` 和 `-x`
 - 支持 `--mode auto|interactive|batch`
-- 支持 `--sure`，用于绕过 sure-rm，直接调用系统命令
+- 支持 `-s` / `--sure`，用于绕过 sure-rm，直接调用系统命令
 - 支持 `unlink` 形式的入口：
   - `sure-rm unlink [--] <path>`
   - 也可以将二进制以 `unlink` 的名称调用
@@ -37,30 +53,14 @@ brew install sure-rm
 ## 示例
 
 ```sh
-sure-rm -rv build
-sure-rm --sure -rf build
-sure-rm list
-sure-rm restore 1774864212-68302-250054000
-sure-rm -W ./notes.txt
-sure-rm -Pv old.log
-sure-rm unlink -- -file
+sure-rm -rv build              # 将 build/ 移入回收目录，显示详细信息
+sure-rm -sf build              # 绕过 sure-rm，直接执行 /bin/rm -f build
+sure-rm list                   # 列出回收目录中的所有条目
+sure-rm restore 1774864212-68302-250054000  # 按 id 恢复指定条目
+sure-rm -W ./notes.txt         # 恢复 notes.txt 最近一次被移入回收目录的副本
+sure-rm -Pv old.log            # 永久删除，不进入回收目录
+sure-rm unlink -- -file        # 安全地 unlink 一个名为 "-file" 的文件
 ```
-
-## 模式
-
-`--mode` 和 `SURE_RM_MODE` 支持以下取值：
-
-- `auto`：根据 TTY 情况自动判断
-- `interactive`：对风险较高的操作默认增加一次确认
-- `batch`：不额外增加隐式确认
-
-`interactive` 模式适合配合 shell alias 使用，例如：
-
-```sh
-alias rm='sure-rm --mode interactive'
-```
-
-在这种配置下，`rm --sure ...` 可以作为回退到系统原生命令的显式开关。
 
 ## 回收根目录
 

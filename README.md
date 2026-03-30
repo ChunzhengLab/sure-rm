@@ -15,13 +15,29 @@ brew install sure-rm
 
 See [homebrew-tap](https://github.com/ChunzhengLab/homebrew-tap) for details.
 
+## Modes
+
+`--mode` and `SURE_RM_MODE` support:
+
+- `auto`: use TTY detection
+- `interactive`: default to a one-time confirmation for riskier operations
+- `batch`: do not add extra implicit confirmations
+
+The `interactive` mode is intended for shell aliases such as:
+
+```sh
+alias rm='sure-rm --mode interactive'
+```
+
+In that setup, `rm -s ...` (or `rm --sure ...`) becomes the escape hatch to the normal system command.
+
 ## Features
 
 - Safer `rm`-style deletion for files, symlinks, and directories
 - `list`, `restore`, and `purge` commands
 - `-d`, `-f`, `-i`, `-I`, `-P`, `-r/-R`, `-v`, `-W`, and `-x`
 - `--mode auto|interactive|batch`
-- `--sure` to bypass sure-rm and run the system command
+- `-s` / `--sure` to bypass sure-rm and run the system command
 - `unlink`-style entry point:
   - `sure-rm unlink [--] <path>`
   - or invoke the binary via the name `unlink`
@@ -37,30 +53,14 @@ See [homebrew-tap](https://github.com/ChunzhengLab/homebrew-tap) for details.
 ## Examples
 
 ```sh
-sure-rm -rv build
-sure-rm --sure -rf build
-sure-rm list
-sure-rm restore 1774864212-68302-250054000
-sure-rm -W ./notes.txt
-sure-rm -Pv old.log
-sure-rm unlink -- -file
+sure-rm -rv build              # move build/ to trash, verbose output
+sure-rm -sf build              # bypass sure-rm, exec /bin/rm -f build
+sure-rm list                   # list all entries in the trash
+sure-rm restore 1774864212-68302-250054000  # restore a specific entry by id
+sure-rm -W ./notes.txt         # restore the latest trashed copy of notes.txt
+sure-rm -Pv old.log            # permanently delete, skip the trash
+sure-rm unlink -- -file        # safely unlink a file named "-file"
 ```
-
-## Modes
-
-`--mode` and `SURE_RM_MODE` support:
-
-- `auto`: use TTY detection
-- `interactive`: default to a one-time confirmation for riskier operations
-- `batch`: do not add extra implicit confirmations
-
-The `interactive` mode is intended for shell aliases such as:
-
-```sh
-alias rm='sure-rm --mode interactive'
-```
-
-In that setup, `rm --sure ...` becomes the escape hatch to the normal system command.
 
 ## Trash Root
 

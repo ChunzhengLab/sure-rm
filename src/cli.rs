@@ -124,7 +124,7 @@ Delete options:
   -f        ignore missing files and disable per-path prompts
   -i        ask before every removal
   -I        ask once before removing many paths or any directory
-  --sure    bypass sure-rm and exec the system rm/unlink command
+  -s, --sure  bypass sure-rm and exec the system rm/unlink command
   --mode    auto, interactive, or batch
   -x        refuse recursive operations that would cross filesystem boundaries
   -P        permanently delete instead of moving into sure-rm trash

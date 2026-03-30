@@ -87,6 +87,11 @@ fn has_sure_flag(args: &[std::ffi::OsString]) -> bool {
         if arg == "--sure" {
             return true;
         }
+        if let Some(text) = arg.to_str() {
+            if text.starts_with('-') && !text.starts_with("--") && text.contains('s') {
+                return true;
+            }
+        }
     }
     false
 }
@@ -150,6 +155,19 @@ fn filter_passthrough_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsStrin
             if let Some(text) = arg.to_str()
                 && text.starts_with("--mode=")
             {
+                continue;
+            }
+
+            // Strip -s from combined short flags, keep the rest
+            if let Some(text) = arg.to_str()
+                && text.starts_with('-')
+                && !text.starts_with("--")
+                && text.contains('s')
+            {
+                let remaining: String = text[1..].chars().filter(|&c| c != 's').collect();
+                if !remaining.is_empty() {
+                    filtered.push(std::ffi::OsString::from(format!("-{remaining}")));
+                }
                 continue;
             }
         }
