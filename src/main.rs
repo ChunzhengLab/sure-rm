@@ -1,0 +1,769 @@
+mod cli;
+mod store;
+
+use std::env;
+use std::fs;
+use std::io::{IsTerminal, stderr, stdin};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, ExitCode};
+
+use cli::{Command, DeleteOptions, PurgeOptions, RequestedMode, RestoreOptions, UnlinkOptions};
+use store::{MoveOutcome, TrashRecord};
+
+enum DeleteResult {
+    PermanentlyDeleted(PathBuf),
+    Trashed(TrashRecord),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectiveMode {
+    Interactive,
+    Batch,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SureBypass {
+    program: &'static str,
+    args: Vec<std::ffi::OsString>,
+}
+
+fn main() -> ExitCode {
+    if let Err(message) = maybe_exec_sure_bypass() {
+        eprintln!("sure-rm: {message}");
+        return ExitCode::from(1);
+    }
+
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("sure-rm: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    match cli::parse_args()? {
+        Command::Delete(options) => run_delete(options),
+        Command::List => run_list(),
+        Command::Restore(options) => run_restore(options),
+        Command::Purge(options) => run_purge(options),
+        Command::Unlink(options) => run_unlink(options),
+        Command::Help => {
+            print!("{}", cli::usage());
+            Ok(())
+        }
+    }
+}
+
+fn maybe_exec_sure_bypass() -> Result<(), String> {
+    let argv: Vec<std::ffi::OsString> = env::args_os().collect();
+
+    let Some(bypass) = build_sure_bypass(&argv) else {
+        return Ok(());
+    };
+
+    let error = ProcessCommand::new(bypass.program)
+        .args(&bypass.args)
+        .exec();
+
+    Err(format!("failed to exec {}: {}", bypass.program, error))
+}
+
+fn is_non_bypass_subcommand(arg: Option<&std::ffi::OsString>) -> bool {
+    matches!(
+        arg.and_then(|a| a.to_str()),
+        Some("list" | "restore" | "purge" | "help" | "--help")
+    )
+}
+
+fn has_sure_flag(args: &[std::ffi::OsString]) -> bool {
+    for arg in args {
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--sure" {
+            return true;
+        }
+    }
+    false
+}
+
+fn build_sure_bypass(argv: &[std::ffi::OsString]) -> Option<SureBypass> {
+    if argv.len() <= 1 || !has_sure_flag(&argv[1..]) {
+        return None;
+    }
+
+    // --sure bypass only applies to delete and unlink operations.
+    // Anything recognized as a subcommand is excluded. When adding a new
+    // subcommand to cli::parse_args, add it here too so it won't bypass.
+    if is_non_bypass_subcommand(argv.get(1)) {
+        return None;
+    }
+
+    if cli::invoked_as_unlink(argv.first()) {
+        return Some(SureBypass {
+            program: "/bin/unlink",
+            args: filter_passthrough_args(&argv[1..]),
+        });
+    }
+
+    let invoked_subcommand_unlink = argv.get(1).and_then(|arg| arg.to_str()) == Some("unlink");
+    let (program, args) = if invoked_subcommand_unlink {
+        ("/bin/unlink", filter_passthrough_args(&argv[2..]))
+    } else {
+        ("/bin/rm", filter_passthrough_args(&argv[1..]))
+    };
+
+    Some(SureBypass { program, args })
+}
+
+fn filter_passthrough_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
+    let mut filtered = Vec::new();
+    let mut parsing_options = true;
+    let mut skip_mode_value = false;
+
+    for arg in args {
+        if skip_mode_value {
+            skip_mode_value = false;
+            continue;
+        }
+
+        if parsing_options {
+            if arg == "--sure" {
+                continue;
+            }
+
+            if arg == "--" {
+                parsing_options = false;
+                filtered.push(arg.clone());
+                continue;
+            }
+
+            if arg == "--mode" {
+                skip_mode_value = true;
+                continue;
+            }
+
+            if let Some(text) = arg.to_str()
+                && text.starts_with("--mode=")
+            {
+                continue;
+            }
+        }
+
+        filtered.push(arg.clone());
+    }
+
+    filtered
+}
+
+fn run_unlink(options: UnlinkOptions) -> Result<(), String> {
+    let delete_options = DeleteOptions {
+        mode: RequestedMode::Batch,
+        paths: vec![options.path.clone()],
+        ..DeleteOptions::default()
+    };
+
+    match delete_one(&options.path, &delete_options) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("{}: {}", options.path.display(), error)),
+    }
+}
+
+fn run_delete(options: DeleteOptions) -> Result<(), String> {
+    if options.paths.is_empty() {
+        if options.force && !options.undelete {
+            return Ok(());
+        }
+
+        print!("{}", cli::usage());
+        return Err("missing path operands".to_string());
+    }
+
+    let mode = resolve_mode(options.mode);
+
+    if options.undelete {
+        return run_undelete(options, mode);
+    }
+
+    let should_prompt_once = options.interactive_once
+        || (mode == EffectiveMode::Interactive
+            && should_auto_prompt_once(&options)
+            && should_prompt_once(&options.paths));
+
+    if should_prompt_once {
+        let prompt = format!(
+            "{} {} entr{}?",
+            if options.permanent {
+                "permanently delete"
+            } else {
+                "move"
+            },
+            options.paths.len(),
+            if options.paths.len() == 1 { "y" } else { "ies" }
+        );
+        if !confirm(&prompt)? {
+            return Ok(());
+        }
+    }
+
+    let mut had_error = false;
+
+    for path in &options.paths {
+        if options.interactive_each {
+            let prompt = format!("remove {}?", path.display());
+            if !confirm(&prompt)? {
+                continue;
+            }
+        }
+
+        match delete_one(path, &options) {
+            Ok(Some(result)) => {
+                if options.verbose {
+                    print_delete_result(result);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                had_error = true;
+                eprintln!("sure-rm: {}: {}", path.display(), error);
+            }
+        }
+    }
+
+    if had_error {
+        Err("one or more paths could not be removed".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn run_undelete(options: DeleteOptions, mode: EffectiveMode) -> Result<(), String> {
+    let should_prompt_once = options.interactive_once
+        || (mode == EffectiveMode::Interactive
+            && should_auto_prompt_once_for_undelete(&options)
+            && should_prompt_once_for_undelete(&options.paths));
+
+    if should_prompt_once {
+        let prompt = format!(
+            "restore {} entr{} from sure-rm trash?",
+            options.paths.len(),
+            if options.paths.len() == 1 { "y" } else { "ies" }
+        );
+        if !confirm(&prompt)? {
+            return Ok(());
+        }
+    }
+
+    let mut had_error = false;
+
+    for path in &options.paths {
+        if options.interactive_each {
+            let prompt = format!("restore {}?", path.display());
+            if !confirm(&prompt)? {
+                continue;
+            }
+        }
+
+        match undelete_one(path, &options) {
+            Ok(Some(restored_path)) => {
+                if options.verbose {
+                    println!("restored {}", restored_path.display());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                had_error = true;
+                eprintln!("sure-rm: {}: {}", path.display(), error);
+            }
+        }
+    }
+
+    if had_error {
+        Err("one or more paths could not be restored".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResult>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if options.force && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
+    if let Some(reason) = reject_dangerous_target(path, &metadata)? {
+        return Err(reason);
+    }
+
+    if !metadata.file_type().is_symlink() && metadata.is_dir() {
+        if options.recursive {
+            if options.one_file_system {
+                ensure_same_file_system_tree(path, metadata.dev())?;
+            }
+        } else if options.allow_dir {
+            ensure_directory_is_empty(path)?;
+        } else {
+            return Err("is a directory (use -r, -R, or -d)".to_string());
+        }
+    }
+
+    if options.permanent {
+        permanently_delete(path, &metadata, options)?;
+        return Ok(Some(DeleteResult::PermanentlyDeleted(path.to_path_buf())));
+    }
+
+    store::move_to_trash(path)
+        .map(DeleteResult::Trashed)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn undelete_one(path: &Path, options: &DeleteOptions) -> Result<Option<PathBuf>, String> {
+    let record = match store::find_latest_record_by_original_path(path) {
+        Ok(Some(record)) => record,
+        Ok(None) if options.force => return Ok(None),
+        Ok(None) => return Err("not found in sure-rm trash".to_string()),
+        Err(error) => return Err(error.to_string()),
+    };
+
+    store::restore(&record.id, None)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>, String> {
+    if path == Path::new("/") {
+        return Ok(Some("refusing to remove /".to_string()));
+    }
+
+    if path == Path::new(".") || path == Path::new("..") {
+        return Ok(Some("refusing to remove . or ..".to_string()));
+    }
+
+    if metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+
+    let canonical_target = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let canonical_cwd = fs::canonicalize(&cwd).map_err(|error| error.to_string())?;
+    let home = store::home_dir().map_err(|error| error.to_string())?;
+    let canonical_home = fs::canonicalize(&home).unwrap_or(home);
+
+    if canonical_target == PathBuf::from("/") {
+        return Ok(Some("refusing to remove /".to_string()));
+    }
+
+    if canonical_target == canonical_cwd || canonical_cwd.starts_with(&canonical_target) {
+        return Ok(Some(
+            "refusing to remove the current working directory or one of its parents".to_string(),
+        ));
+    }
+
+    if canonical_target == canonical_home || canonical_home.starts_with(&canonical_target) {
+        return Ok(Some(
+            "refusing to remove the home directory or one of its parents".to_string(),
+        ));
+    }
+
+    Ok(None)
+}
+
+fn ensure_directory_is_empty(path: &Path) -> Result<(), String> {
+    let mut entries = fs::read_dir(path).map_err(|error| error.to_string())?;
+    if entries.next().is_some() {
+        Err("directory not empty".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_same_file_system_tree(path: &Path, expected_dev: u64) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.dev() != expected_dev {
+        return Err(format!(
+            "cross-device entry blocked by -x: {}",
+            path.display()
+        ));
+    }
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let child_path = entry.path();
+        ensure_same_file_system_tree(&child_path, expected_dev)?;
+    }
+
+    Ok(())
+}
+
+fn permanently_delete(
+    path: &Path,
+    metadata: &fs::Metadata,
+    options: &DeleteOptions,
+) -> Result<(), String> {
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() || metadata.is_file() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        if options.recursive {
+            fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        } else if options.allow_dir {
+            fs::remove_dir(path).map_err(|error| error.to_string())?;
+        } else {
+            return Err("is a directory (use -r, -R, or -d)".to_string());
+        }
+
+        return Ok(());
+    }
+
+    fs::remove_file(path).map_err(|error| error.to_string())
+}
+
+fn run_list() -> Result<(), String> {
+    let mut records = store::list_records().map_err(|error| error.to_string())?;
+    if records.is_empty() {
+        println!("sure-rm trash is empty");
+        return Ok(());
+    }
+
+    records.sort_by(|left, right| right.deleted_at_secs.cmp(&left.deleted_at_secs));
+
+    for record in records {
+        println!(
+            "{}\t{}\t{}\t{}",
+            record.id,
+            record.kind.as_str(),
+            record.deleted_at_secs,
+            record.original_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn run_restore(options: RestoreOptions) -> Result<(), String> {
+    let restored_path = store::restore(&options.id, options.destination.as_deref())
+        .map_err(|error| error.to_string())?;
+    println!("restored {}", restored_path.display());
+    Ok(())
+}
+
+fn run_purge(options: PurgeOptions) -> Result<(), String> {
+    if options.all {
+        let records = store::list_records().map_err(|error| error.to_string())?;
+        for record in records {
+            purge_record(&record)?;
+        }
+        return Ok(());
+    }
+
+    if options.ids.is_empty() {
+        return Err("purge requires at least one id or --all".to_string());
+    }
+
+    for id in &options.ids {
+        let record = store::read_record(id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("unknown id: {id}"))?;
+        purge_record(&record)?;
+    }
+
+    Ok(())
+}
+
+fn purge_record(record: &TrashRecord) -> Result<(), String> {
+    match fs::symlink_metadata(&record.trashed_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+            fs::remove_dir_all(&record.trashed_path).map_err(|error| error.to_string())?;
+        }
+        Ok(_) => {
+            fs::remove_file(&record.trashed_path).map_err(|error| error.to_string())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    if let Err(error) = store::delete_record_file(record) {
+        eprintln!(
+            "sure-rm: warning: purged data but failed to remove metadata for {}: {error}",
+            record.id
+        );
+    }
+    println!("purged {}", record.id);
+    Ok(())
+}
+
+fn should_prompt_once(paths: &[PathBuf]) -> bool {
+    if paths.len() > 3 {
+        return true;
+    }
+
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => return true,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+
+    false
+}
+
+fn should_auto_prompt_once(options: &DeleteOptions) -> bool {
+    !options.force
+        && !options.interactive_each
+        && !options.interactive_once
+        && (options.recursive || options.allow_dir || options.paths.len() > 3)
+}
+
+fn should_auto_prompt_once_for_undelete(options: &DeleteOptions) -> bool {
+    !options.force
+        && !options.interactive_each
+        && !options.interactive_once
+        && options.paths.len() > 1
+}
+
+fn should_prompt_once_for_undelete(paths: &[PathBuf]) -> bool {
+    paths.len() > 1
+}
+
+fn resolve_mode(requested: RequestedMode) -> EffectiveMode {
+    match requested {
+        RequestedMode::Auto => {
+            if stdin().is_terminal() && stderr().is_terminal() {
+                EffectiveMode::Interactive
+            } else {
+                EffectiveMode::Batch
+            }
+        }
+        RequestedMode::Interactive => EffectiveMode::Interactive,
+        RequestedMode::Batch => EffectiveMode::Batch,
+    }
+}
+
+fn confirm(prompt: &str) -> Result<bool, String> {
+    use std::io::{self, Write};
+
+    eprint!("{prompt} [y/N] ");
+    io::stderr().flush().map_err(|error| error.to_string())?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| error.to_string())?;
+
+    let answer = input.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+fn print_delete_result(result: DeleteResult) {
+    match result {
+        DeleteResult::PermanentlyDeleted(path) => {
+            println!("deleted {}", path.display());
+        }
+        DeleteResult::Trashed(record) => match record.outcome {
+            MoveOutcome::CentralTrash => {
+                println!(
+                    "trashed {} -> {}",
+                    record.original_path.display(),
+                    record.trashed_path.display()
+                );
+            }
+            MoveOutcome::SiblingFallback => {
+                println!(
+                    "trashed {} -> {} (same-directory fallback)",
+                    record.original_path.display(),
+                    record.trashed_path.display()
+                );
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EffectiveMode, SureBypass, build_sure_bypass, filter_passthrough_args, resolve_mode,
+        should_auto_prompt_once, should_auto_prompt_once_for_undelete,
+    };
+    use crate::cli::{DeleteOptions, RequestedMode};
+    use std::ffi::OsString;
+
+    #[test]
+    fn sure_after_double_dash_does_not_trigger_bypass() {
+        let bypass = build_sure_bypass(&[
+            OsString::from("sure-rm"),
+            OsString::from("--"),
+            OsString::from("--sure"),
+        ]);
+
+        assert!(bypass.is_none());
+    }
+
+    #[test]
+    fn sure_before_double_dash_still_triggers_bypass() {
+        let bypass = build_sure_bypass(&[
+            OsString::from("sure-rm"),
+            OsString::from("--sure"),
+            OsString::from("--"),
+            OsString::from("file"),
+        ]);
+
+        assert!(bypass.is_some());
+    }
+
+    #[test]
+    fn sure_bypass_skips_non_delete_subcommands() {
+        for subcommand in &["list", "restore", "purge", "help", "--help"] {
+            let bypass = build_sure_bypass(&[
+                OsString::from("sure-rm"),
+                OsString::from(*subcommand),
+                OsString::from("--sure"),
+            ]);
+
+            assert!(bypass.is_none(), "bypass should not trigger for {subcommand}");
+        }
+    }
+
+    #[test]
+    fn auto_prompt_once_for_recursive_delete() {
+        let options = DeleteOptions {
+            recursive: true,
+            ..DeleteOptions::default()
+        };
+
+        assert!(should_auto_prompt_once(&options));
+    }
+
+    #[test]
+    fn force_disables_auto_prompt_once() {
+        let options = DeleteOptions {
+            recursive: true,
+            force: true,
+            ..DeleteOptions::default()
+        };
+
+        assert!(!should_auto_prompt_once(&options));
+    }
+
+    #[test]
+    fn auto_prompt_once_for_multi_restore_only() {
+        let options = DeleteOptions {
+            undelete: true,
+            paths: vec!["one".into(), "two".into()],
+            ..DeleteOptions::default()
+        };
+
+        assert!(should_auto_prompt_once_for_undelete(&options));
+    }
+
+    #[test]
+    fn explicit_mode_resolution_is_stable() {
+        assert_eq!(
+            resolve_mode(RequestedMode::Interactive),
+            EffectiveMode::Interactive
+        );
+        assert_eq!(resolve_mode(RequestedMode::Batch), EffectiveMode::Batch);
+    }
+
+    #[test]
+    fn force_without_paths_is_a_noop() {
+        let options = DeleteOptions {
+            force: true,
+            ..DeleteOptions::default()
+        };
+
+        assert!(super::run_delete(options).is_ok());
+    }
+
+    #[test]
+    fn undelete_without_paths_still_errors_even_with_force() {
+        let options = DeleteOptions {
+            force: true,
+            undelete: true,
+            ..DeleteOptions::default()
+        };
+
+        assert_eq!(
+            super::run_delete(options).unwrap_err(),
+            "missing path operands"
+        );
+    }
+
+    #[test]
+    fn sure_bypass_uses_rm_and_strips_sure_rm_flags() {
+        let bypass = build_sure_bypass(&[
+            OsString::from("sure-rm"),
+            OsString::from("--mode"),
+            OsString::from("interactive"),
+            OsString::from("--sure"),
+            OsString::from("-rf"),
+            OsString::from("target"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            bypass,
+            SureBypass {
+                program: "/bin/rm",
+                args: vec![OsString::from("-rf"), OsString::from("target")],
+            }
+        );
+    }
+
+    #[test]
+    fn sure_bypass_uses_unlink_for_subcommand() {
+        let bypass = build_sure_bypass(&[
+            OsString::from("sure-rm"),
+            OsString::from("unlink"),
+            OsString::from("--sure"),
+            OsString::from("--"),
+            OsString::from("-file"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            bypass,
+            SureBypass {
+                program: "/bin/unlink",
+                args: vec![OsString::from("--"), OsString::from("-file")],
+            }
+        );
+    }
+
+    #[test]
+    fn filter_passthrough_args_keeps_operands_after_double_dash() {
+        let filtered = filter_passthrough_args(&[
+            OsString::from("--mode=interactive"),
+            OsString::from("--"),
+            OsString::from("--mode"),
+            OsString::from("--sure"),
+            OsString::from("file"),
+        ]);
+
+        assert_eq!(
+            filtered,
+            vec![
+                OsString::from("--"),
+                OsString::from("--mode"),
+                OsString::from("--sure"),
+                OsString::from("file"),
+            ]
+        );
+    }
+}
