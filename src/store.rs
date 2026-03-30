@@ -172,6 +172,7 @@ pub fn restore(id: &str, destination: Option<&Path>) -> io::Result<PathBuf> {
     Ok(target)
 }
 
+
 pub fn find_latest_record_by_original_path(path: &Path) -> io::Result<Option<TrashRecord>> {
     let target = absolute_path(path)?;
     let mut records = list_records()?;

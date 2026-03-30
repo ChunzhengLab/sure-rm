@@ -193,7 +193,7 @@ fn run_unlink(options: UnlinkOptions) -> Result<(), String> {
 
 fn run_delete(options: DeleteOptions) -> Result<(), String> {
     if options.paths.is_empty() {
-        if options.force && !options.undelete {
+        if options.force {
             return Ok(());
         }
 
@@ -203,9 +203,6 @@ fn run_delete(options: DeleteOptions) -> Result<(), String> {
 
     let mode = resolve_mode(options.mode);
 
-    if options.undelete {
-        return run_undelete(options, mode);
-    }
 
     let should_prompt_once = options.interactive_once
         || (mode == EffectiveMode::Interactive
@@ -259,53 +256,6 @@ fn run_delete(options: DeleteOptions) -> Result<(), String> {
     }
 }
 
-fn run_undelete(options: DeleteOptions, mode: EffectiveMode) -> Result<(), String> {
-    let should_prompt_once = options.interactive_once
-        || (mode == EffectiveMode::Interactive
-            && should_auto_prompt_once_for_undelete(&options)
-            && should_prompt_once_for_undelete(&options.paths));
-
-    if should_prompt_once {
-        let prompt = format!(
-            "restore {} entr{} from sure-rm trash?",
-            options.paths.len(),
-            if options.paths.len() == 1 { "y" } else { "ies" }
-        );
-        if !confirm(&prompt)? {
-            return Ok(());
-        }
-    }
-
-    let mut had_error = false;
-
-    for path in &options.paths {
-        if options.interactive_each {
-            let prompt = format!("restore {}?", path.display());
-            if !confirm(&prompt)? {
-                continue;
-            }
-        }
-
-        match undelete_one(path, &options) {
-            Ok(Some(restored_path)) => {
-                if options.verbose {
-                    println!("restored {}", restored_path.display());
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                had_error = true;
-                eprintln!("sure-rm: {}: {}", path.display(), error);
-            }
-        }
-    }
-
-    if had_error {
-        Err("one or more paths could not be restored".to_string())
-    } else {
-        Ok(())
-    }
-}
 
 fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResult>, String> {
     let metadata = match fs::symlink_metadata(path) {
@@ -343,18 +293,6 @@ fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResul
         .map_err(|error| error.to_string())
 }
 
-fn undelete_one(path: &Path, options: &DeleteOptions) -> Result<Option<PathBuf>, String> {
-    let record = match store::find_latest_record_by_original_path(path) {
-        Ok(Some(record)) => record,
-        Ok(None) if options.force => return Ok(None),
-        Ok(None) => return Err("not found in sure-rm trash".to_string()),
-        Err(error) => return Err(error.to_string()),
-    };
-
-    store::restore(&record.id, None)
-        .map(Some)
-        .map_err(|error| error.to_string())
-}
 
 fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>, String> {
     if path == Path::new("/") {
@@ -475,7 +413,19 @@ fn run_list() -> Result<(), String> {
 }
 
 fn run_restore(options: RestoreOptions) -> Result<(), String> {
-    let restored_path = store::restore(&options.id, options.destination.as_deref())
+    // Try by id first, then fall back to matching by original path
+    let id = match store::read_record(&options.id) {
+        Ok(Some(_)) => options.id.clone(),
+        _ => {
+            let path = PathBuf::from(&options.id);
+            let record = store::find_latest_record_by_original_path(&path)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("not found in trash: {}", options.id))?;
+            record.id
+        }
+    };
+
+    let restored_path = store::restore(&id, options.destination.as_deref())
         .map_err(|error| error.to_string())?;
     println!("restored {}", restored_path.display());
     Ok(())
@@ -549,16 +499,6 @@ fn should_auto_prompt_once(options: &DeleteOptions) -> bool {
         && (options.recursive || options.allow_dir || options.paths.len() > 3)
 }
 
-fn should_auto_prompt_once_for_undelete(options: &DeleteOptions) -> bool {
-    !options.force
-        && !options.interactive_each
-        && !options.interactive_once
-        && options.paths.len() > 1
-}
-
-fn should_prompt_once_for_undelete(paths: &[PathBuf]) -> bool {
-    paths.len() > 1
-}
 
 fn resolve_mode(requested: RequestedMode) -> EffectiveMode {
     match requested {
@@ -617,7 +557,7 @@ fn print_delete_result(result: DeleteResult) {
 mod tests {
     use super::{
         EffectiveMode, SureBypass, build_sure_bypass, filter_passthrough_args, resolve_mode,
-        should_auto_prompt_once, should_auto_prompt_once_for_undelete,
+        should_auto_prompt_once,
     };
     use crate::cli::{DeleteOptions, RequestedMode};
     use std::ffi::OsString;
@@ -680,17 +620,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_prompt_once_for_multi_restore_only() {
-        let options = DeleteOptions {
-            undelete: true,
-            paths: vec!["one".into(), "two".into()],
-            ..DeleteOptions::default()
-        };
-
-        assert!(should_auto_prompt_once_for_undelete(&options));
-    }
-
-    #[test]
     fn explicit_mode_resolution_is_stable() {
         assert_eq!(
             resolve_mode(RequestedMode::Interactive),
@@ -709,19 +638,6 @@ mod tests {
         assert!(super::run_delete(options).is_ok());
     }
 
-    #[test]
-    fn undelete_without_paths_still_errors_even_with_force() {
-        let options = DeleteOptions {
-            force: true,
-            undelete: true,
-            ..DeleteOptions::default()
-        };
-
-        assert_eq!(
-            super::run_delete(options).unwrap_err(),
-            "missing path operands"
-        );
-    }
 
     #[test]
     fn sure_bypass_uses_rm_and_strips_sure_rm_flags() {
@@ -760,6 +676,42 @@ mod tests {
             SureBypass {
                 program: "/bin/unlink",
                 args: vec![OsString::from("--"), OsString::from("-file")],
+            }
+        );
+    }
+
+    #[test]
+    fn short_s_triggers_sure_bypass() {
+        let bypass = build_sure_bypass(&[
+            OsString::from("sure-rm"),
+            OsString::from("-sf"),
+            OsString::from("target"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            bypass,
+            SureBypass {
+                program: "/bin/rm",
+                args: vec![OsString::from("-f"), OsString::from("target")],
+            }
+        );
+    }
+
+    #[test]
+    fn short_s_alone_triggers_sure_bypass() {
+        let bypass = build_sure_bypass(&[
+            OsString::from("sure-rm"),
+            OsString::from("-s"),
+            OsString::from("target"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            bypass,
+            SureBypass {
+                program: "/bin/rm",
+                args: vec![OsString::from("target")],
             }
         );
     }

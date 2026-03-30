@@ -55,7 +55,6 @@ pub struct DeleteOptions {
     pub one_file_system: bool,
     pub permanent: bool,
     pub recursive: bool,
-    pub undelete: bool,
     pub verbose: bool,
     pub paths: Vec<PathBuf>,
 }
@@ -129,7 +128,6 @@ Delete options:
   -x        refuse recursive operations that would cross filesystem boundaries
   -P        permanently delete instead of moving into sure-rm trash
   -v        print where the entry was moved
-  -W        restore the latest trashed entry for each original path
   --help    show this help
 
 By default sure-rm moves paths into its trash instead of hard-deleting them.
@@ -292,7 +290,7 @@ fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String>
                             'x' => options.one_file_system = true,
                             'P' => options.permanent = true,
                             'v' => options.verbose = true,
-                            'W' => options.undelete = true,
+                            'W' => return Err("sure-rm no longer supports -W; use `sure-rm restore` instead".to_string()),
                             'h' => return Ok(Command::Help),
                             _ => return Err(format!("unknown option: -{short}")),
                         }
@@ -305,13 +303,6 @@ fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String>
         options.paths.push(PathBuf::from(arg));
     }
 
-    if options.permanent && options.undelete {
-        return Err("cannot combine -P and -W".to_string());
-    }
-
-    if options.undelete && (options.allow_dir || options.one_file_system || options.recursive) {
-        return Err("cannot combine -W with -d, -r, -R, or -x".to_string());
-    }
 
     Ok(Command::Delete(options))
 }
@@ -368,13 +359,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_conflicting_p_and_w() {
-        let error =
-            parse_delete(OsString::from("-PW"), vec![OsString::from("target")]).unwrap_err();
-        assert_eq!(error, "cannot combine -P and -W");
-    }
-
-    #[test]
     fn parses_mode_long_option() {
         let command = parse_delete(
             OsString::from("--mode"),
@@ -414,6 +398,13 @@ mod tests {
         };
 
         assert_eq!(options.path, PathBuf::from("-file"));
+    }
+
+    #[test]
+    fn w_flag_returns_error() {
+        let error =
+            parse_delete(OsString::from("-W"), vec![OsString::from("target")]).unwrap_err();
+        assert!(error.contains("restore"));
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 [中文](README.zh-cn.md)
 
-`sure-rm` is a safer `rm`-style tool written in Rust. It defaults to moving paths into a recoverable trash store instead of hard-deleting them.
+`sure-rm` is a command-line tool written in Rust. It works just like the system `rm`.
 
-This project is intentionally not a bit-for-bit clone of system `rm`. The interface is familiar, but the default behavior is safer.
+Instead of permanently deleting files from disk, it moves them into a recoverable trash store. Files are only permanently deleted when you explicitly ask for it.
 
 ## Install
 
@@ -17,56 +17,71 @@ See [homebrew-tap](https://github.com/ChunzhengLab/homebrew-tap) for details.
 
 ## Modes
 
-`--mode` and `SURE_RM_MODE` support:
+`--mode` and the `SURE_RM_MODE` environment variable support three modes:
 
-- `auto`: use TTY detection
-- `interactive`: default to a one-time confirmation for riskier operations
-- `batch`: do not add extra implicit confirmations
+- `auto`: detect based on TTY
+- `interactive`: prompt once for riskier operations
+- `batch`: no extra prompts, execute directly
 
-The `interactive` mode is intended for shell aliases such as:
+**The recommended setup is `interactive` mode with a shell alias:**
 
 ```sh
 alias rm='sure-rm --mode interactive'
 ```
 
-In that setup, `rm -s ...` (or `rm --sure ...`) becomes the escape hatch to the normal system command.
+Or set the default mode via environment variable:
+
+```sh
+export SURE_RM_MODE=interactive
+alias rm='sure-rm'
+```
+
+**This makes `rm` behave as sure-rm. When you need a real delete, use `rm -s ...` (or `rm --sure ...`) to fall back to the system command.**
 
 ## Features
 
-- Safer `rm`-style deletion for files, symlinks, and directories
-- `list`, `restore`, and `purge` commands
-- `-d`, `-f`, `-i`, `-I`, `-P`, `-r/-R`, `-v`, `-W`, and `-x`
-- `--mode auto|interactive|batch`
-- `-s` / `--sure` to bypass sure-rm and run the system command
-- `unlink`-style entry point:
-  - `sure-rm unlink [--] <path>`
-  - or invoke the binary via the name `unlink`
-- Dangerous targets like `/`, `.`, `..`, the current working directory, and `HOME` are blocked
+Safely delete files, symlinks, and directories — moved to trash by default instead of permanent deletion.
 
-### Differences from BSD rm
+### Subcommands
 
-| Flag | BSD rm | sure-rm |
-|------|--------|---------|
-| `-P` | No effect (kept for backwards compatibility) | Permanently delete, bypassing the trash |
-| `-W` | Undelete via union filesystem whiteouts | Restore the latest trashed entry for the given path |
+- `list` — view all entries in the trash
+- `restore` — restore an entry by id or by original path
+- `purge` — permanently clean the trash, by id or `--all`
+- `unlink` — single-file delete entry point: `sure-rm unlink [--] <path>`
+
+### Options
+
+- Supports nearly all `rm` options: `-d`, `-f`, `-i`, `-I`, `-P`, `-r/-R`, `-v`, `-x`
+- `-P` permanently delete, skip the trash
+- `-s` / `--sure` bypass sure-rm, exec system `/bin/rm` or `/bin/unlink`
+- `--mode auto|interactive|batch` control prompt behavior, also configurable via `SURE_RM_MODE`
+
+### Safety
+
+- Automatically blocks dangerous targets like `/`, `.`, `..`, current directory, and `HOME`
 
 ## Examples
 
 ```sh
-sure-rm -rv build              # move build/ to trash, verbose output
-sure-rm -sf build              # bypass sure-rm, exec /bin/rm -f build
-sure-rm list                   # list all entries in the trash
-sure-rm restore 1774864212-68302-250054000  # restore a specific entry by id
-sure-rm -W ./notes.txt         # restore the latest trashed copy of notes.txt
-sure-rm -Pv old.log            # permanently delete, skip the trash
-sure-rm unlink -- -file        # safely unlink a file named "-file"
+# Set up alias
+alias rm='sure-rm --mode interactive'
+
+rm -rv build                           # move build/ to trash, verbose output
+rm -sf build                           # bypass sure-rm, exec /bin/rm -f build
+rm list                                # list all entries in the trash
+rm restore 1774864212-68302-250054000  # restore a specific entry by id
+rm restore ./notes.txt                 # restore by relative path
+rm restore ../docs/notes.txt           # cross-directory relative path works too
+rm restore /home/user/notes.txt        # restore by absolute path
+rm -Pv old.log                         # permanently delete, skip the trash
+rm unlink -- -file                     # unlink a file named "-file"
 ```
 
-## Trash Root
+## Trash
 
-By default the trash lives under `~/.sure-rm`.
+The trash is located at `~/.sure-rm` by default.
 
-For testing or sandboxed execution you can override it:
+You can override the trash path via environment variable for testing or sandboxed execution:
 
 ```sh
 SURE_RM_ROOT=/tmp/sure-rm sure-rm -rv some-directory
