@@ -83,6 +83,13 @@ rm unlink -- -file                     # unlink a file named "-file"
 
 The trash is located at `~/.sure-rm` by default.
 
+```sh
+rm list                                # view trash contents
+rm restore ./notes.txt                 # restore a file
+rm purge 1774864212-68302-250054000    # permanently delete one entry
+rm purge --all                         # empty the trash
+```
+
 You can override the trash path via environment variable for testing or sandboxed execution:
 
 ```sh

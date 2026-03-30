@@ -83,12 +83,18 @@ rm unlink -- -file                     # unlink 一个名为 "-file" 的文件
 
 回收站默认位于 `~/.sure-rm`。
 
+```sh
+rm list                                # 查看回收站内容
+rm restore ./notes.txt                 # 恢复文件
+rm purge 1774864212-68302-250054000    # 彻底删除某条记录
+rm purge --all                         # 清空回收站
+```
+
 在测试或沙箱环境下，可以通过环境变量覆盖回收站路径：
 
 ```sh
 SURE_RM_ROOT=/tmp/sure-rm sure-rm -rv some-directory
 ```
-
 
 ## 灵感来源
 

@@ -85,9 +85,29 @@ pub fn parse_args() -> Result<Command, String> {
         return parse_unlink(rest);
     }
 
-    let Some(first) = rest.first().cloned() else {
-        return Ok(Command::Help);
-    };
+    // Strip leading --mode/--mode=... so subcommands work with aliases
+    // like `alias rm='sure-rm --mode interactive'`.
+    // The mode value is preserved and re-injected for delete commands.
+    let mut rest = rest;
+    let mut leading_mode: Vec<OsString> = Vec::new();
+    loop {
+        let Some(first) = rest.first() else {
+            return Ok(Command::Help);
+        };
+        if let Some(text) = first.to_str() {
+            if text == "--mode" {
+                leading_mode.extend(rest.drain(..2));
+                continue;
+            }
+            if text.starts_with("--mode=") {
+                leading_mode.push(rest.remove(0));
+                continue;
+            }
+        }
+        break;
+    }
+
+    let first = rest[0].clone();
 
     match first.to_str() {
         Some("help") => Ok(Command::Help),
@@ -102,13 +122,20 @@ pub fn parse_args() -> Result<Command, String> {
         }
         Some("restore") => parse_restore(rest[1..].to_vec()),
         Some("purge") => parse_purge(rest[1..].to_vec()),
-        _ => parse_delete(first, rest[1..].to_vec()),
+        _ => {
+            // Re-inject --mode for delete parsing
+            let mut delete_args = leading_mode;
+            delete_args.push(first);
+            delete_args.extend(rest[1..].iter().cloned());
+            let first = delete_args.remove(0);
+            parse_delete(first, delete_args)
+        }
     }
 }
 
 pub fn usage() -> &'static str {
     "\
-sure-rm 0.2.0
+sure-rm 0.2.1
 
 Usage:
   sure-rm [OPTIONS] <PATH>...
