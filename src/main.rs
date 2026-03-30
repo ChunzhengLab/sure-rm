@@ -445,9 +445,15 @@ fn run_purge(options: PurgeOptions) -> Result<(), String> {
     }
 
     for id in &options.ids {
-        let record = store::read_record(id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("unknown id: {id}"))?;
+        let record = match store::read_record(id) {
+            Ok(Some(record)) => record,
+            _ => {
+                let path = PathBuf::from(id);
+                store::find_latest_record_by_original_path(&path)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("not found in trash: {id}"))?
+            }
+        };
         purge_record(&record)?;
     }
 

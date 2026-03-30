@@ -111,7 +111,7 @@ pub fn parse_args() -> Result<Command, String> {
 
     match first.to_str() {
         Some("help") => Ok(Command::Help),
-        Some("--help") => Ok(Command::Help),
+        Some("--help") | Some("-h") => Ok(Command::Help),
         Some("unlink") => parse_unlink(rest[1..].to_vec()),
         Some("list") => {
             if rest.len() > 1 {
@@ -135,7 +135,7 @@ pub fn parse_args() -> Result<Command, String> {
 
 pub fn usage() -> &'static str {
     "\
-sure-rm 0.2.1
+sure-rm 0.2.2
 
 Usage:
   sure-rm [OPTIONS] <PATH>...
@@ -145,17 +145,17 @@ Usage:
   sure-rm unlink [--] <PATH>
 
 Delete options:
-  -d        allow removing an empty directory without -r
-  -r, -R    allow directory removal
-  -f        ignore missing files and disable per-path prompts
-  -i        ask before every removal
-  -I        ask once before removing many paths or any directory
+  -d          allow removing an empty directory without -r
+  -r, -R      allow directory removal
+  -f          ignore missing files and disable per-path prompts
+  -i          ask before every removal
+  -I          ask once before removing many paths or any directory
   -s, --sure  bypass sure-rm and exec the system rm/unlink command
-  --mode    auto, interactive, or batch
-  -x        refuse recursive operations that would cross filesystem boundaries
-  -P        permanently delete instead of moving into sure-rm trash
-  -v        print where the entry was moved
-  --help    show this help
+  --mode      auto, interactive, or batch
+  -x          refuse recursive operations that would cross filesystem boundaries
+  -P          permanently delete instead of moving into sure-rm trash
+  -v          print where the entry was moved
+  -h, --help  show this help
 
 By default sure-rm moves paths into its trash instead of hard-deleting them.
 SURE_RM_MODE can also set auto, interactive, or batch.
@@ -187,7 +187,7 @@ fn parse_restore(args: Vec<OsString>) -> Result<Command, String> {
                 };
                 destination = Some(PathBuf::from(path));
             }
-            Some("--help") => return Ok(Command::Help),
+            Some("--help") | Some("-h") => return Ok(Command::Help),
             Some(value) if value.starts_with('-') => {
                 return Err(format!("unknown restore option: {value}"));
             }
@@ -211,7 +211,7 @@ fn parse_purge(args: Vec<OsString>) -> Result<Command, String> {
     for arg in args {
         match arg.to_str() {
             Some("--all") => options.all = true,
-            Some("--help") => return Ok(Command::Help),
+            Some("--help") | Some("-h") => return Ok(Command::Help),
             Some(value) if value.starts_with('-') => {
                 return Err(format!("unknown purge option: {value}"));
             }
@@ -228,7 +228,7 @@ fn parse_unlink(args: Vec<OsString>) -> Result<Command, String> {
     let mut parsing_options = true;
 
     for arg in args {
-        if parsing_options && arg == "--help" {
+        if parsing_options && (arg == "--help" || arg == "-h") {
             return Ok(Command::Help);
         }
 
