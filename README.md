@@ -48,13 +48,13 @@ Safely delete files, symlinks, and directories — moved to trash by default ins
 
 - `list` — view all entries in the trash
 - `restore` — restore an entry by id or by original path
-- `purge` — permanently clean the trash, by id or `--all`
+- `purge` — permanently clean the trash, by id, by path, or `--all`
 - `unlink` — single-file delete entry point: `sure-rm unlink [--] <path>`
 
 ### Options
 
-- Supports nearly all `rm` options: `-d`, `-f`, `-i`, `-I`, `-P`, `-r/-R`, `-v`, `-x`
-- `-P` permanently delete, skip the trash
+- Supports nearly all `rm` options: `-d`, `-f`, `-i`, `-I`, `-p`, `-r/-R`, `-v`, `-x`
+- `-p` permanently delete, skip the trash
 - `-s` / `--sure` bypass sure-rm, exec system `/bin/rm` or `/bin/unlink`
 - `--mode auto|interactive|batch` control prompt behavior, also configurable via `SURE_RM_MODE`
 
@@ -75,7 +75,7 @@ rm restore 1774864212-68302-250054000  # restore a specific entry by id
 rm restore ./notes.txt                 # restore by relative path
 rm restore ../docs/notes.txt           # cross-directory relative path works too
 rm restore /home/user/notes.txt        # restore by absolute path
-rm -Pv old.log                         # permanently delete, skip the trash
+rm -pv old.log                         # permanently delete, skip the trash
 rm unlink -- -file                     # unlink a file named "-file"
 ```
 
@@ -86,7 +86,8 @@ The trash is located at `~/.sure-rm` by default.
 ```sh
 rm list                                # view trash contents
 rm restore ./notes.txt                 # restore a file
-rm purge 1774864212-68302-250054000    # permanently delete one entry
+rm purge 1774864212-68302-250054000    # permanently delete one entry by id
+rm purge ./notes.txt                   # permanently delete one entry by path
 rm purge --all                         # empty the trash
 ```
 

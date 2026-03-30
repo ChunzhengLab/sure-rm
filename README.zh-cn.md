@@ -48,13 +48,13 @@ alias rm='sure-rm'
 
 - `list` 查看回收站中的所有条目
 - `restore` 恢复指定条目，支持按 id 或按原始路径恢复
-- `purge` 彻底清理回收站，支持按 id 清理单条或 `--all` 清理全部
+- `purge` 彻底清理回收站，支持按 id、按路径清理单条或 `--all` 清理全部
 - `unlink` 单文件删除入口：`sure-rm unlink [--] <path>`
 
 ### 选项
 
-- 支持 `rm` 几乎全部选项：`-d`、`-f`、`-i`、`-I`、`-P`、`-r/-R`、`-v`、`-x`
-- `-P` 永久删除，跳过回收站
+- 支持 `rm` 几乎全部选项：`-d`、`-f`、`-i`、`-I`、`-p`、`-r/-R`、`-v`、`-x`
+- `-p` 永久删除，跳过回收站
 - `-s` / `--sure` 绕过 sure-rm，直接调用系统 `/bin/rm` 或 `/bin/unlink`
 - `--mode auto|interactive|batch` 控制确认行为，也可通过 `SURE_RM_MODE` 环境变量设置
 
@@ -75,7 +75,7 @@ rm restore 1774864212-68302-250054000  # 按 id 恢复指定条目
 rm restore ./notes.txt                 # 按相对路径恢复
 rm restore ../docs/notes.txt           # 跨目录相对路径也可以
 rm restore /home/user/notes.txt        # 按绝对路径恢复
-rm -Pv old.log                         # 永久删除，不进回收站
+rm -pv old.log                         # 永久删除，不进回收站
 rm unlink -- -file                     # unlink 一个名为 "-file" 的文件
 ```
 
@@ -86,7 +86,8 @@ rm unlink -- -file                     # unlink 一个名为 "-file" 的文件
 ```sh
 rm list                                # 查看回收站内容
 rm restore ./notes.txt                 # 恢复文件
-rm purge 1774864212-68302-250054000    # 彻底删除某条记录
+rm purge 1774864212-68302-250054000    # 按 id 彻底删除某条记录
+rm purge ./notes.txt                   # 按路径彻底删除某条记录
 rm purge --all                         # 清空回收站
 ```
 

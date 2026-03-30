@@ -51,8 +51,8 @@ fn run() -> Result<(), String> {
         Command::Restore(options) => run_restore(options),
         Command::Purge(options) => run_purge(options),
         Command::Unlink(options) => run_unlink(options),
-        Command::Help => {
-            print!("{}", cli::usage());
+        Command::Help(topic) => {
+            print!("{}", cli::subcommand_usage(topic));
             Ok(())
         }
     }

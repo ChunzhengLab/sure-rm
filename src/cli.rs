@@ -9,7 +9,16 @@ pub enum Command {
     Restore(RestoreOptions),
     Purge(PurgeOptions),
     Unlink(UnlinkOptions),
-    Help,
+    Help(HelpTopic),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelpTopic {
+    General,
+    List,
+    Restore,
+    Purge,
+    Unlink,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -92,7 +101,7 @@ pub fn parse_args() -> Result<Command, String> {
     let mut leading_mode: Vec<OsString> = Vec::new();
     loop {
         let Some(first) = rest.first() else {
-            return Ok(Command::Help);
+            return Ok(Command::Help(HelpTopic::General));
         };
         if let Some(text) = first.to_str() {
             if text == "--mode" {
@@ -110,11 +119,15 @@ pub fn parse_args() -> Result<Command, String> {
     let first = rest[0].clone();
 
     match first.to_str() {
-        Some("help") => Ok(Command::Help),
-        Some("--help") | Some("-h") => Ok(Command::Help),
+        Some("help") => Ok(Command::Help(HelpTopic::General)),
+        Some("--help") | Some("-h") => Ok(Command::Help(HelpTopic::General)),
         Some("unlink") => parse_unlink(rest[1..].to_vec()),
         Some("list") => {
-            if rest.len() > 1 {
+            if rest.get(1).and_then(|a| a.to_str()) == Some("-h")
+                || rest.get(1).and_then(|a| a.to_str()) == Some("--help")
+            {
+                Ok(Command::Help(HelpTopic::List))
+            } else if rest.len() > 1 {
                 Err("list does not accept positional arguments".to_string())
             } else {
                 Ok(Command::List)
@@ -136,6 +149,8 @@ pub fn parse_args() -> Result<Command, String> {
 pub fn usage() -> &'static str {
     "\
 sure-rm 0.2.2
+A safer rm that moves files to trash instead of deleting them.
+Use -s/--sure to bypass and exec the system rm.
 
 Usage:
   sure-rm [OPTIONS] <PATH>...
@@ -144,23 +159,60 @@ Usage:
   sure-rm purge [--all] [ID...]
   sure-rm unlink [--] <PATH>
 
-Delete options:
-  -d          allow removing an empty directory without -r
+Options:
   -r, -R      allow directory removal
+  -d          allow removing an empty directory without -r
+  -p          permanently delete instead of moving into sure-rm trash
+  -x          refuse recursive operations that would cross filesystem boundaries
   -f          ignore missing files and disable per-path prompts
   -i          ask before every removal
   -I          ask once before removing many paths or any directory
-  -s, --sure  bypass sure-rm and exec the system rm/unlink command
   --mode      auto, interactive, or batch
-  -x          refuse recursive operations that would cross filesystem boundaries
-  -P          permanently delete instead of moving into sure-rm trash
+  -s, --sure  bypass sure-rm and exec the system rm/unlink command
   -v          print where the entry was moved
   -h, --help  show this help
 
-By default sure-rm moves paths into its trash instead of hard-deleting them.
-SURE_RM_MODE can also set auto, interactive, or batch.
-If invoked as unlink, sure-rm accepts a single path and still performs safe removal.
 "
+}
+
+pub fn subcommand_usage(topic: HelpTopic) -> &'static str {
+    match topic {
+        HelpTopic::General => usage(),
+        HelpTopic::List => "\
+list all entries in sure-rm trash
+
+Usage: sure-rm list
+
+Options:
+  -h, --help    show this help
+",
+        HelpTopic::Restore => "\
+restore a trashed entry by id or by original path
+
+Usage: sure-rm restore <ID|PATH> [--to <PATH>]
+
+Options:
+  --to <PATH>   restore to a different location
+  -h, --help    show this help
+",
+        HelpTopic::Purge => "\
+permanently delete entries from sure-rm trash
+
+Usage: sure-rm purge [--all] [ID|PATH...]
+
+Options:
+  --all         purge all entries
+  -h, --help    show this help
+",
+        HelpTopic::Unlink => "\
+safely delete a single file
+
+Usage: sure-rm unlink [--] <PATH>
+
+Options:
+  -h, --help    show this help
+",
+    }
 }
 
 pub fn invoked_as_unlink(program: Option<&OsString>) -> bool {
@@ -187,7 +239,7 @@ fn parse_restore(args: Vec<OsString>) -> Result<Command, String> {
                 };
                 destination = Some(PathBuf::from(path));
             }
-            Some("--help") | Some("-h") => return Ok(Command::Help),
+            Some("--help") | Some("-h") => return Ok(Command::Help(HelpTopic::Restore)),
             Some(value) if value.starts_with('-') => {
                 return Err(format!("unknown restore option: {value}"));
             }
@@ -211,7 +263,7 @@ fn parse_purge(args: Vec<OsString>) -> Result<Command, String> {
     for arg in args {
         match arg.to_str() {
             Some("--all") => options.all = true,
-            Some("--help") | Some("-h") => return Ok(Command::Help),
+            Some("--help") | Some("-h") => return Ok(Command::Help(HelpTopic::Purge)),
             Some(value) if value.starts_with('-') => {
                 return Err(format!("unknown purge option: {value}"));
             }
@@ -229,7 +281,7 @@ fn parse_unlink(args: Vec<OsString>) -> Result<Command, String> {
 
     for arg in args {
         if parsing_options && (arg == "--help" || arg == "-h") {
-            return Ok(Command::Help);
+            return Ok(Command::Help(HelpTopic::Unlink));
         }
 
         if parsing_options && arg == "--" {
@@ -270,7 +322,7 @@ fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String>
 
     while let Some(arg) = iter.next() {
         if parsing_options && arg == "--help" {
-            return Ok(Command::Help);
+            return Ok(Command::Help(HelpTopic::General));
         }
 
         if parsing_options && arg == "--" {
@@ -315,10 +367,10 @@ fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String>
                             }
                             'I' => options.interactive_once = true,
                             'x' => options.one_file_system = true,
-                            'P' => options.permanent = true,
+                            'p' => options.permanent = true,
                             'v' => options.verbose = true,
                             'W' => return Err("sure-rm no longer supports -W; use `sure-rm restore` instead".to_string()),
-                            'h' => return Ok(Command::Help),
+                            'h' => return Ok(Command::Help(HelpTopic::General)),
                             _ => return Err(format!("unknown option: -{short}")),
                         }
                     }
@@ -373,7 +425,7 @@ mod tests {
     #[test]
     fn parses_d_x_p_flags() {
         let command =
-            parse_delete(OsString::from("-dxPv"), vec![OsString::from("target")]).unwrap();
+            parse_delete(OsString::from("-dxpv"), vec![OsString::from("target")]).unwrap();
 
         let Command::Delete(options) = command else {
             panic!("expected delete command");
