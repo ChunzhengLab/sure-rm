@@ -38,6 +38,8 @@ alias rm='sure-rm'
 
 **This makes `rm` behave as sure-rm. When you need a real delete, use `rm -s ...` (or `rm --sure ...`) to fall back to the system command.**
 
+> **Note:** Shell aliases only apply in interactive terminals. In scripts, `rm` remains `/bin/rm` and existing automation is unaffected.
+
 ## Features
 
 Safely delete files, symlinks, and directories — moved to trash by default instead of permanent deletion.
