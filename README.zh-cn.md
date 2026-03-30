@@ -2,7 +2,18 @@
 
 `sure-rm` 是一个用 Rust 编写的命令行工具，接口风格接近 `rm`，但默认采用更安全的删除策略。除非显式要求永久删除，否则它会先将目标移入可恢复的回收目录，而不是直接从文件系统中抹除。
 
-## 当前范围
+本项目并不追求对系统 `rm` 的逐项复刻，而是在保留常见使用习惯的前提下，将默认行为调整为更稳妥的方案。
+
+## 安装
+
+```sh
+brew tap ChunzhengLab/tap
+brew install sure-rm
+```
+
+详见 [homebrew-tap](https://github.com/ChunzhengLab/homebrew-tap)。
+
+## 功能
 
 - 提供更安全的 `rm` 式删除，适用于文件、符号链接和目录
 - 提供 `list`、`restore` 和 `purge` 三个子命令
@@ -12,15 +23,6 @@
 - 支持 `unlink` 形式的入口：
   - `sure-rm unlink [--] <path>`
   - 也可以将二进制以 `unlink` 的名称调用
-
-本项目并不追求对系统 `rm` 的逐项复刻，而是在保留常见使用习惯的前提下，将默认行为调整为更稳妥的方案。
-
-## 安全模型
-
-- 默认删除：将目标移入 sure-rm 的回收目录
-- `--sure`：完全绕过 sure-rm，直接执行 `/bin/rm` 或 `/bin/unlink`
-- `-P`：永久删除，不进入回收目录
-- `-W`：恢复指定原始路径最近一次移入回收目录的条目
 - 会阻止删除高风险目标，例如 `/`、`.`、`..`、当前工作目录以及 `HOME`
 
 ### 与 BSD rm 的差异
@@ -29,6 +31,18 @@
 |------|--------|---------|
 | `-P` | 无效果（仅为向后兼容保留） | 永久删除，不进入回收目录 |
 | `-W` | 通过 union 文件系统 whiteout 恢复 | 从回收目录恢复指定路径最近一次删除的条目 |
+
+## 示例
+
+```sh
+sure-rm -rv build
+sure-rm --sure -rf build
+sure-rm list
+sure-rm restore 1774864212-68302-250054000
+sure-rm -W ./notes.txt
+sure-rm -Pv old.log
+sure-rm unlink -- -file
+```
 
 ## 模式
 
@@ -56,14 +70,6 @@ alias rm='sure-rm --mode interactive'
 SURE_RM_ROOT=/tmp/sure-rm sure-rm -rv some-directory
 ```
 
-## 示例
+## 灵感来源
 
-```sh
-sure-rm -rv build
-sure-rm --sure -rf build
-sure-rm list
-sure-rm restore 1774864212-68302-250054000
-sure-rm -W ./notes.txt
-sure-rm -Pv old.log
-sure-rm unlink -- -file
-```
+受 [jwanLab](https://github.com/jwanLab) 启发——她花了数月时间构建了一个叹为观止的项目，然后用不到一秒的时间把它删除了。
