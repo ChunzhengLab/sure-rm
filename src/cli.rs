@@ -105,6 +105,9 @@ pub fn parse_args() -> Result<Command, String> {
         };
         if let Some(text) = first.to_str() {
             if text == "--mode" {
+                if rest.len() < 2 {
+                    return Err("missing value after --mode".to_string());
+                }
                 leading_mode.extend(rest.drain(..2));
                 continue;
             }
@@ -122,33 +125,21 @@ pub fn parse_args() -> Result<Command, String> {
         Some("help") => Ok(Command::Help(HelpTopic::General)),
         Some("--help") | Some("-h") => Ok(Command::Help(HelpTopic::General)),
         Some("unlink") => parse_unlink(rest[1..].to_vec()),
-        Some("list") => {
-            if rest.get(1).and_then(|a| a.to_str()) == Some("-h")
-                || rest.get(1).and_then(|a| a.to_str()) == Some("--help")
-            {
-                Ok(Command::Help(HelpTopic::List))
-            } else if rest.len() > 1 {
-                Err("list does not accept positional arguments".to_string())
-            } else {
-                Ok(Command::List)
-            }
-        }
+        Some("list") => parse_list(rest[1..].to_vec()),
         Some("restore") => parse_restore(rest[1..].to_vec()),
         Some("purge") => parse_purge(rest[1..].to_vec()),
         _ => {
-            // Re-inject --mode for delete parsing
             let mut delete_args = leading_mode;
-            delete_args.push(first);
-            delete_args.extend(rest[1..].iter().cloned());
-            let first = delete_args.remove(0);
-            parse_delete(first, delete_args)
+            delete_args.extend(rest);
+            parse_delete(delete_args)
         }
     }
 }
 
-pub fn usage() -> &'static str {
-    "\
-sure-rm 0.2.4
+pub fn usage() -> String {
+    format!(
+        "\
+sure-rm {}
 A safer rm that moves files to trash instead of deleting them.
 Use -s/--sure to bypass and exec the system rm.
 
@@ -172,21 +163,26 @@ Options:
   -v          print where the entry was moved
   -h, --help  show this help
 
-"
+",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
-pub fn subcommand_usage(topic: HelpTopic) -> &'static str {
+pub fn subcommand_usage(topic: HelpTopic) -> String {
     match topic {
-        HelpTopic::General => usage(),
-        HelpTopic::List => "\
+        HelpTopic::General => return usage(),
+        HelpTopic::List => {
+            "\
 list all entries in sure-rm trash
 
 Usage: sure-rm list
 
 Options:
   -h, --help    show this help
-",
-        HelpTopic::Restore => "\
+"
+        }
+        HelpTopic::Restore => {
+            "\
 restore a trashed entry by id or by original path
 
 Usage: sure-rm restore <ID|PATH> [--to <PATH>]
@@ -194,8 +190,10 @@ Usage: sure-rm restore <ID|PATH> [--to <PATH>]
 Options:
   --to <PATH>   restore to a different location
   -h, --help    show this help
-",
-        HelpTopic::Purge => "\
+"
+        }
+        HelpTopic::Purge => {
+            "\
 permanently delete entries from sure-rm trash
 
 Usage: sure-rm purge [--all] [ID|PATH...]
@@ -203,16 +201,20 @@ Usage: sure-rm purge [--all] [ID|PATH...]
 Options:
   --all         purge all entries
   -h, --help    show this help
-",
-        HelpTopic::Unlink => "\
+"
+        }
+        HelpTopic::Unlink => {
+            "\
 safely delete a single file
 
 Usage: sure-rm unlink [--] <PATH>
 
 Options:
   -h, --help    show this help
-",
+"
+        }
     }
+    .to_string()
 }
 
 pub fn invoked_as_unlink(program: Option<&OsString>) -> bool {
@@ -224,6 +226,16 @@ pub fn invoked_as_unlink(program: Option<&OsString>) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         == Some("unlink")
+}
+
+fn parse_list(args: Vec<OsString>) -> Result<Command, String> {
+    if let Some(arg) = args.first() {
+        if matches!(arg.to_str(), Some("-h" | "--help")) {
+            return Ok(Command::Help(HelpTopic::List));
+        }
+        return Err("list does not accept positional arguments".to_string());
+    }
+    Ok(Command::List)
 }
 
 fn parse_restore(args: Vec<OsString>) -> Result<Command, String> {
@@ -307,16 +319,12 @@ fn parse_unlink(args: Vec<OsString>) -> Result<Command, String> {
     Ok(Command::Unlink(UnlinkOptions { path }))
 }
 
-fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String> {
+fn parse_delete(args: Vec<OsString>) -> Result<Command, String> {
     let mut options = DeleteOptions {
         mode: RequestedMode::from_env()?,
         ..DeleteOptions::default()
     };
     let mut parsing_options = true;
-
-    let mut args = Vec::with_capacity(rest.len() + 1);
-    args.push(first);
-    args.extend(rest);
 
     let mut iter = args.into_iter();
 
@@ -369,7 +377,12 @@ fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String>
                             'x' => options.one_file_system = true,
                             'p' => options.permanent = true,
                             'v' => options.verbose = true,
-                            'W' => return Err("sure-rm no longer supports -W; use `sure-rm restore` instead".to_string()),
+                            'W' => {
+                                return Err(
+                                    "sure-rm no longer supports -W; use `sure-rm restore` instead"
+                                        .to_string(),
+                                );
+                            }
                             'h' => return Ok(Command::Help(HelpTopic::General)),
                             _ => return Err(format!("unknown option: -{short}")),
                         }
@@ -382,7 +395,6 @@ fn parse_delete(first: OsString, rest: Vec<OsString>) -> Result<Command, String>
         options.paths.push(PathBuf::from(arg));
     }
 
-
     Ok(Command::Delete(options))
 }
 
@@ -392,15 +404,14 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(|s| OsString::from(s)).collect()
+    }
+
     #[test]
     fn parses_combined_short_flags() {
-        let command = parse_delete(
-            OsString::from("-rfv"),
-            vec![OsString::from("target"), OsString::from("other")],
-        )
-        .unwrap();
-
-        let Command::Delete(options) = command else {
+        let Command::Delete(options) = parse_delete(os(&["-rfv", "target", "other"])).unwrap()
+        else {
             panic!("expected delete command");
         };
 
@@ -412,9 +423,7 @@ mod tests {
 
     #[test]
     fn i_overrides_previous_f() {
-        let command = parse_delete(OsString::from("-fi"), vec![OsString::from("target")]).unwrap();
-
-        let Command::Delete(options) = command else {
+        let Command::Delete(options) = parse_delete(os(&["-fi", "target"])).unwrap() else {
             panic!("expected delete command");
         };
 
@@ -424,10 +433,7 @@ mod tests {
 
     #[test]
     fn parses_d_x_p_flags() {
-        let command =
-            parse_delete(OsString::from("-dxpv"), vec![OsString::from("target")]).unwrap();
-
-        let Command::Delete(options) = command else {
+        let Command::Delete(options) = parse_delete(os(&["-dxpv", "target"])).unwrap() else {
             panic!("expected delete command");
         };
 
@@ -439,13 +445,9 @@ mod tests {
 
     #[test]
     fn parses_mode_long_option() {
-        let command = parse_delete(
-            OsString::from("--mode"),
-            vec![OsString::from("interactive"), OsString::from("target")],
-        )
-        .unwrap();
-
-        let Command::Delete(options) = command else {
+        let Command::Delete(options) =
+            parse_delete(os(&["--mode", "interactive", "target"])).unwrap()
+        else {
             panic!("expected delete command");
         };
 
@@ -455,13 +457,8 @@ mod tests {
 
     #[test]
     fn parses_mode_equals_syntax() {
-        let command = parse_delete(
-            OsString::from("--mode=batch"),
-            vec![OsString::from("target")],
-        )
-        .unwrap();
-
-        let Command::Delete(options) = command else {
+        let Command::Delete(options) = parse_delete(os(&["--mode=batch", "target"])).unwrap()
+        else {
             panic!("expected delete command");
         };
 
@@ -470,9 +467,7 @@ mod tests {
 
     #[test]
     fn parses_unlink_path() {
-        let command = parse_unlink(vec![OsString::from("--"), OsString::from("-file")]).unwrap();
-
-        let Command::Unlink(options) = command else {
+        let Command::Unlink(options) = parse_unlink(os(&["--", "-file"])).unwrap() else {
             panic!("expected unlink command");
         };
 
@@ -481,8 +476,7 @@ mod tests {
 
     #[test]
     fn w_flag_returns_error() {
-        let error =
-            parse_delete(OsString::from("-W"), vec![OsString::from("target")]).unwrap_err();
+        let error = parse_delete(os(&["-W", "target"])).unwrap_err();
         assert!(error.contains("restore"));
     }
 

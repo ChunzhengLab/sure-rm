@@ -97,6 +97,18 @@ You can override the trash path via environment variable for testing or sandboxe
 SURE_RM_ROOT=/tmp/sure-rm sure-rm -rv some-directory
 ```
 
+### Auto-expiry (TTL)
+
+Set `SURE_RM_TTL` to automatically purge entries older than the specified duration. Expired entries are cleaned up when running `list`.
+
+```sh
+export SURE_RM_TTL=30d   # 30 days (default unit is days)
+export SURE_RM_TTL=12h   # 12 hours
+export SURE_RM_TTL=3600s # 3600 seconds
+```
+
+Set to `0` or leave unset to disable auto-expiry.
+
 ## Inspiration
 
 Inspired by [jwanLab](https://github.com/jwanLab), who spent months building an awesome project, then deleted it in less than a second.

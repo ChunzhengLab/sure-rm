@@ -97,6 +97,18 @@ rm purge --all                         # 清空回收站
 SURE_RM_ROOT=/tmp/sure-rm sure-rm -rv some-directory
 ```
 
+### 自动过期（TTL）
+
+设置 `SURE_RM_TTL` 可以自动清理超过指定时间的条目。过期条目会在执行 `list` 时被清理。
+
+```sh
+export SURE_RM_TTL=30d   # 30 天（默认单位为天）
+export SURE_RM_TTL=12h   # 12 小时
+export SURE_RM_TTL=3600s # 3600 秒
+```
+
+设为 `0` 或不设置则禁用自动过期。
+
 ## 灵感来源
 
 受 [jwanLab](https://github.com/jwanLab) 启发——她花了数月时间构建了一个不可思议的项目，然后用不到一秒的时间把它删除了。

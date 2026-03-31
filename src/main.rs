@@ -12,6 +12,16 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use cli::{Command, DeleteOptions, PurgeOptions, RequestedMode, RestoreOptions, UnlinkOptions};
 use store::{MoveOutcome, TrashRecord};
 
+trait FmtErr<T> {
+    fn fmt_err(self) -> Result<T, String>;
+}
+
+impl<T, E: std::fmt::Display> FmtErr<T> for Result<T, E> {
+    fn fmt_err(self) -> Result<T, String> {
+        self.map_err(|e| e.to_string())
+    }
+}
+
 enum DeleteResult {
     PermanentlyDeleted(PathBuf),
     Trashed(TrashRecord),
@@ -203,13 +213,12 @@ fn run_delete(options: DeleteOptions) -> Result<(), String> {
 
     let mode = resolve_mode(options.mode);
 
-
-    let should_prompt_once = options.interactive_once
+    let prompt_once = options.interactive_once
         || (mode == EffectiveMode::Interactive
             && should_auto_prompt_once(&options)
-            && should_prompt_once(&options.paths));
+            && paths_warrant_prompt(&options.paths));
 
-    if should_prompt_once {
+    if prompt_once {
         let prompt = format!(
             "{} {} entr{}?",
             if options.permanent {
@@ -256,7 +265,6 @@ fn run_delete(options: DeleteOptions) -> Result<(), String> {
     }
 }
 
-
 fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResult>, String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -266,9 +274,7 @@ fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResul
         Err(error) => return Err(error.to_string()),
     };
 
-    if let Some(reason) = reject_dangerous_target(path, &metadata)? {
-        return Err(reason);
-    }
+    reject_dangerous_target(path, &metadata)?;
 
     if !metadata.file_type().is_symlink() && metadata.is_dir() {
         if options.recursive {
@@ -290,50 +296,49 @@ fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResul
     store::move_to_trash(path)
         .map(DeleteResult::Trashed)
         .map(Some)
-        .map_err(|error| error.to_string())
+        .fmt_err()
 }
 
-
-fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>, String> {
+fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
     if path == Path::new("/") {
-        return Ok(Some("refusing to remove /".to_string()));
+        return Err("refusing to remove /".to_string());
     }
 
     if path == Path::new(".") || path == Path::new("..") {
-        return Ok(Some("refusing to remove . or ..".to_string()));
+        return Err("refusing to remove . or ..".to_string());
     }
 
     if metadata.file_type().is_symlink() {
-        return Ok(None);
+        return Ok(());
     }
 
-    let canonical_target = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let canonical_cwd = fs::canonicalize(&cwd).map_err(|error| error.to_string())?;
-    let home = store::home_dir().map_err(|error| error.to_string())?;
+    let canonical_target = fs::canonicalize(path).fmt_err()?;
+    let cwd = std::env::current_dir().fmt_err()?;
+    let canonical_cwd = fs::canonicalize(&cwd).fmt_err()?;
+    let home = store::home_dir().fmt_err()?;
     let canonical_home = fs::canonicalize(&home).unwrap_or(home);
 
     if canonical_target == PathBuf::from("/") {
-        return Ok(Some("refusing to remove /".to_string()));
+        return Err("refusing to remove /".to_string());
     }
 
     if canonical_target == canonical_cwd || canonical_cwd.starts_with(&canonical_target) {
-        return Ok(Some(
+        return Err(
             "refusing to remove the current working directory or one of its parents".to_string(),
-        ));
+        );
     }
 
     if canonical_target == canonical_home || canonical_home.starts_with(&canonical_target) {
-        return Ok(Some(
+        return Err(
             "refusing to remove the home directory or one of its parents".to_string(),
-        ));
+        );
     }
 
-    Ok(None)
+    Ok(())
 }
 
 fn ensure_directory_is_empty(path: &Path) -> Result<(), String> {
-    let mut entries = fs::read_dir(path).map_err(|error| error.to_string())?;
+    let mut entries = fs::read_dir(path).fmt_err()?;
     if entries.next().is_some() {
         Err("directory not empty".to_string())
     } else {
@@ -342,7 +347,7 @@ fn ensure_directory_is_empty(path: &Path) -> Result<(), String> {
 }
 
 fn ensure_same_file_system_tree(path: &Path, expected_dev: u64) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(path).fmt_err()?;
     if metadata.dev() != expected_dev {
         return Err(format!(
             "cross-device entry blocked by -x: {}",
@@ -354,8 +359,8 @@ fn ensure_same_file_system_tree(path: &Path, expected_dev: u64) -> Result<(), St
         return Ok(());
     }
 
-    for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(path).fmt_err()? {
+        let entry = entry.fmt_err()?;
         let child_path = entry.path();
         ensure_same_file_system_tree(&child_path, expected_dev)?;
     }
@@ -368,30 +373,26 @@ fn permanently_delete(
     metadata: &fs::Metadata,
     options: &DeleteOptions,
 ) -> Result<(), String> {
-    let file_type = metadata.file_type();
-
-    if file_type.is_symlink() || metadata.is_file() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-
-    if metadata.is_dir() {
+    if !metadata.file_type().is_symlink() && metadata.is_dir() {
         if options.recursive {
-            fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+            fs::remove_dir_all(path).fmt_err()
         } else if options.allow_dir {
-            fs::remove_dir(path).map_err(|error| error.to_string())?;
+            fs::remove_dir(path).fmt_err()
         } else {
-            return Err("is a directory (use -r, -R, or -d)".to_string());
+            Err("is a directory (use -r, -R, or -d)".to_string())
         }
-
-        return Ok(());
+    } else {
+        fs::remove_file(path).fmt_err()
     }
-
-    fs::remove_file(path).map_err(|error| error.to_string())
 }
 
 fn run_list() -> Result<(), String> {
-    let mut records = store::list_records().map_err(|error| error.to_string())?;
+    let purged = store::purge_expired_records().fmt_err()?;
+    for record in &purged {
+        eprintln!("sure-rm: expired (TTL): {}", record.original_path.display());
+    }
+
+    let mut records = store::list_records().fmt_err()?;
     if records.is_empty() {
         println!("sure-rm trash is empty");
         return Ok(());
@@ -412,28 +413,26 @@ fn run_list() -> Result<(), String> {
     Ok(())
 }
 
-fn run_restore(options: RestoreOptions) -> Result<(), String> {
-    // Try by id first, then fall back to matching by original path
-    let id = match store::read_record(&options.id) {
-        Ok(Some(_)) => options.id.clone(),
-        _ => {
-            let path = PathBuf::from(&options.id);
-            let record = store::find_latest_record_by_original_path(&path)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("not found in trash: {}", options.id))?;
-            record.id
-        }
-    };
+fn resolve_record(input: &str) -> Result<TrashRecord, String> {
+    if let Ok(Some(record)) = store::read_record(input) {
+        return Ok(record);
+    }
+    let path = PathBuf::from(input);
+    store::find_latest_record_by_original_path(&path)
+        .fmt_err()?
+        .ok_or_else(|| format!("not found in trash: {input}"))
+}
 
-    let restored_path = store::restore(&id, options.destination.as_deref())
-        .map_err(|error| error.to_string())?;
+fn run_restore(options: RestoreOptions) -> Result<(), String> {
+    let record = resolve_record(&options.id)?;
+    let restored_path = store::restore(&record.id, options.destination.as_deref()).fmt_err()?;
     println!("restored {}", restored_path.display());
     Ok(())
 }
 
 fn run_purge(options: PurgeOptions) -> Result<(), String> {
     if options.all {
-        let records = store::list_records().map_err(|error| error.to_string())?;
+        let records = store::list_records().fmt_err()?;
         for record in records {
             purge_record(&record)?;
         }
@@ -445,44 +444,19 @@ fn run_purge(options: PurgeOptions) -> Result<(), String> {
     }
 
     for id in &options.ids {
-        let record = match store::read_record(id) {
-            Ok(Some(record)) => record,
-            _ => {
-                let path = PathBuf::from(id);
-                store::find_latest_record_by_original_path(&path)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| format!("not found in trash: {id}"))?
-            }
-        };
-        purge_record(&record)?;
+        purge_record(&resolve_record(id)?)?;
     }
 
     Ok(())
 }
 
 fn purge_record(record: &TrashRecord) -> Result<(), String> {
-    match fs::symlink_metadata(&record.trashed_path) {
-        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
-            fs::remove_dir_all(&record.trashed_path).map_err(|error| error.to_string())?;
-        }
-        Ok(_) => {
-            fs::remove_file(&record.trashed_path).map_err(|error| error.to_string())?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
-    }
-
-    if let Err(error) = store::delete_record_file(record) {
-        eprintln!(
-            "sure-rm: warning: purged data but failed to remove metadata for {}: {error}",
-            record.id
-        );
-    }
+    store::purge_record_data(record).fmt_err()?;
     println!("purged {}", record.id);
     Ok(())
 }
 
-fn should_prompt_once(paths: &[PathBuf]) -> bool {
+fn paths_warrant_prompt(paths: &[PathBuf]) -> bool {
     if paths.len() > 3 {
         return true;
     }
@@ -505,7 +479,6 @@ fn should_auto_prompt_once(options: &DeleteOptions) -> bool {
         && (options.recursive || options.allow_dir || options.paths.len() > 3)
 }
 
-
 fn resolve_mode(requested: RequestedMode) -> EffectiveMode {
     match requested {
         RequestedMode::Auto => {
@@ -524,12 +497,12 @@ fn confirm(prompt: &str) -> Result<bool, String> {
     use std::io::{self, Write};
 
     eprint!("{prompt} [y/N] ");
-    io::stderr().flush().map_err(|error| error.to_string())?;
+    io::stderr().flush().fmt_err()?;
 
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
-        .map_err(|error| error.to_string())?;
+        .fmt_err()?;
 
     let answer = input.trim();
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
@@ -540,22 +513,18 @@ fn print_delete_result(result: DeleteResult) {
         DeleteResult::PermanentlyDeleted(path) => {
             println!("deleted {}", path.display());
         }
-        DeleteResult::Trashed(record) => match record.outcome {
-            MoveOutcome::CentralTrash => {
-                println!(
-                    "trashed {} -> {}",
-                    record.original_path.display(),
-                    record.trashed_path.display()
-                );
-            }
-            MoveOutcome::SiblingFallback => {
-                println!(
-                    "trashed {} -> {} (same-directory fallback)",
-                    record.original_path.display(),
-                    record.trashed_path.display()
-                );
-            }
-        },
+        DeleteResult::Trashed(record) => {
+            let suffix = match record.outcome {
+                MoveOutcome::CentralTrash => "",
+                MoveOutcome::SiblingFallback => " (same-directory fallback)",
+            };
+            println!(
+                "trashed {} -> {}{}",
+                record.original_path.display(),
+                record.trashed_path.display(),
+                suffix
+            );
+        }
     }
 }
 
@@ -600,7 +569,10 @@ mod tests {
                 OsString::from("--sure"),
             ]);
 
-            assert!(bypass.is_none(), "bypass should not trigger for {subcommand}");
+            assert!(
+                bypass.is_none(),
+                "bypass should not trigger for {subcommand}"
+            );
         }
     }
 
@@ -643,7 +615,6 @@ mod tests {
 
         assert!(super::run_delete(options).is_ok());
     }
-
 
     #[test]
     fn sure_bypass_uses_rm_and_strips_sure_rm_flags() {

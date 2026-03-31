@@ -130,7 +130,10 @@ pub fn list_records() -> io::Result<Vec<TrashRecord>> {
 
 fn validate_id(id: &str) -> io::Result<()> {
     if id.is_empty() || id.contains('/') || id.contains("..") {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid trash id"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid trash id",
+        ));
     }
     Ok(())
 }
@@ -165,13 +168,10 @@ pub fn restore(id: &str, destination: Option<&Path>) -> io::Result<PathBuf> {
 
     fs::rename(&record.trashed_path, &target)?;
     if let Err(error) = delete_record_file(&record) {
-        eprintln!(
-            "sure-rm: warning: restored successfully but failed to remove metadata: {error}"
-        );
+        eprintln!("sure-rm: warning: restored successfully but failed to remove metadata: {error}");
     }
     Ok(target)
 }
-
 
 pub fn find_latest_record_by_original_path(path: &Path) -> io::Result<Option<TrashRecord>> {
     let target = absolute_path(path)?;
@@ -426,10 +426,131 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
     }
 }
 
+pub fn ttl_secs() -> Option<u64> {
+    let value = std::env::var_os("SURE_RM_TTL")?;
+    let text = match value.to_str() {
+        Some(t) => t,
+        None => {
+            eprintln!("sure-rm: warning: SURE_RM_TTL is not valid UTF-8, ignoring");
+            return None;
+        }
+    };
+    match parse_ttl(text) {
+        TtlResult::Enabled(secs) => Some(secs),
+        TtlResult::Disabled => None,
+        TtlResult::Invalid => {
+            eprintln!("sure-rm: warning: invalid SURE_RM_TTL value: {text}, ignoring");
+            None
+        }
+    }
+}
+
+enum TtlResult {
+    Enabled(u64),
+    Disabled,
+    Invalid,
+}
+
+impl TtlResult {
+    fn as_secs(&self) -> Option<u64> {
+        match self {
+            TtlResult::Enabled(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    fn is_invalid(&self) -> bool {
+        matches!(self, TtlResult::Invalid)
+    }
+}
+
+fn parse_ttl(text: &str) -> TtlResult {
+    let text = text.trim();
+    if text.is_empty() {
+        return TtlResult::Disabled;
+    }
+
+    let (digits, multiplier) = if let Some(d) = text.strip_suffix('d') {
+        (d.trim(), 86400)
+    } else if let Some(d) = text.strip_suffix('h') {
+        (d.trim(), 3600)
+    } else if let Some(d) = text.strip_suffix('s') {
+        (d.trim(), 1)
+    } else {
+        (text, 86400)
+    };
+
+    let Ok(n) = digits.parse::<u64>() else {
+        return TtlResult::Invalid;
+    };
+
+    if n == 0 {
+        return TtlResult::Disabled;
+    }
+
+    match n.checked_mul(multiplier) {
+        Some(secs) => TtlResult::Enabled(secs),
+        None => TtlResult::Invalid,
+    }
+}
+
+pub fn purge_record_data(record: &TrashRecord) -> io::Result<()> {
+    match fs::symlink_metadata(&record.trashed_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+            fs::remove_dir_all(&record.trashed_path)?;
+        }
+        Ok(_) => {
+            fs::remove_file(&record.trashed_path)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    if let Err(error) = delete_record_file(record) {
+        eprintln!(
+            "sure-rm: warning: purged data but failed to remove metadata for {}: {error}",
+            record.id
+        );
+    }
+
+    Ok(())
+}
+
+pub fn purge_expired_records() -> io::Result<Vec<TrashRecord>> {
+    let Some(ttl) = ttl_secs() else {
+        return Ok(Vec::new());
+    };
+
+    let now = now_secs()?;
+    let records = list_records()?;
+    let mut purged = Vec::new();
+
+    for record in records {
+        let Some(age) = now.checked_sub(record.deleted_at_secs) else {
+            continue;
+        };
+        if age > ttl {
+            if let Err(error) = purge_record_data(&record) {
+                eprintln!(
+                    "sure-rm: warning: failed to purge expired entry {}: {error}",
+                    record.id
+                );
+            } else {
+                purged.push(record);
+            }
+        }
+    }
+
+    Ok(purged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{hex_decode_bytes, hex_encode_bytes, normalize_absolute_path};
     use std::path::Path;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn hex_round_trip() {
@@ -464,52 +585,176 @@ mod tests {
         assert!(super::delete_record("foo/bar").is_err());
     }
 
-    // This test mutates the SURE_RM_ROOT env var. If more tests need to do
-    // the same, they must be serialized (e.g. via serial_test crate) or use
-    // a design that avoids global state.
+    fn ttl(text: &str) -> Option<u64> {
+        super::parse_ttl(text).as_secs()
+    }
+
+    fn ttl_invalid(text: &str) -> bool {
+        super::parse_ttl(text).is_invalid()
+    }
+
+    #[test]
+    fn parse_ttl_days_suffix() {
+        assert_eq!(ttl("7d"), Some(7 * 86400));
+        assert_eq!(ttl("30d"), Some(30 * 86400));
+    }
+
+    #[test]
+    fn parse_ttl_hours_suffix() {
+        assert_eq!(ttl("24h"), Some(24 * 3600));
+    }
+
+    #[test]
+    fn parse_ttl_seconds_suffix() {
+        assert_eq!(ttl("3600s"), Some(3600));
+    }
+
+    #[test]
+    fn parse_ttl_bare_number_is_days() {
+        assert_eq!(ttl("7"), Some(7 * 86400));
+    }
+
+    #[test]
+    fn parse_ttl_zero_disables() {
+        assert_eq!(ttl("0"), None);
+        assert!(!ttl_invalid("0"));
+        assert_eq!(ttl("0d"), None);
+        assert!(!ttl_invalid("0d"));
+        assert_eq!(ttl("0h"), None);
+        assert!(!ttl_invalid("0h"));
+    }
+
+    #[test]
+    fn parse_ttl_empty_and_disabled() {
+        assert_eq!(ttl(""), None);
+        assert!(!ttl_invalid(""));
+        assert_eq!(ttl("  "), None);
+        assert!(!ttl_invalid("  "));
+    }
+
+    #[test]
+    fn parse_ttl_invalid_values() {
+        assert!(ttl_invalid("abc"));
+        assert!(ttl_invalid("-1"));
+    }
+
+    #[test]
+    fn parse_ttl_overflow_is_invalid() {
+        assert!(ttl_invalid("99999999999999999999d"));
+        assert!(ttl_invalid("99999999999999999999h"));
+        assert!(ttl_invalid("99999999999999999999"));
+    }
+
+    #[test]
+    fn parse_ttl_max_valid_value_does_not_overflow() {
+        let max_days = u64::MAX / 86400;
+        assert!(ttl(&format!("{max_days}d")).is_some());
+        assert!(ttl_invalid(&format!("{}d", max_days + 1)));
+    }
+
+    struct TestEnv {
+        dir: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TestEnv {
+        fn new(name: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let dir = std::env::temp_dir()
+                .join(format!("sure-rm-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            unsafe { std::env::set_var("SURE_RM_ROOT", &dir) };
+            unsafe { std::env::remove_var("SURE_RM_TTL") };
+            TestEnv { dir, _lock: lock }
+        }
+
+        fn add_record(&self, id: &str, age_secs: u64) -> (std::path::PathBuf, std::path::PathBuf) {
+            let trash = self.dir.join("trash");
+            std::fs::create_dir_all(&trash).unwrap();
+            let trash_file = trash.join(id);
+            std::fs::write(&trash_file, "data").unwrap();
+
+            let meta = self.dir.join("meta");
+            std::fs::create_dir_all(&meta).unwrap();
+            let meta_file = meta.join(format!("{id}.meta"));
+            let timestamp = super::now_secs().unwrap().saturating_sub(age_secs);
+            let original_hex = super::hex_encode_bytes(format!("/tmp/{id}").as_bytes());
+            let trashed_hex = super::hex_encode_path(&trash_file);
+            std::fs::write(
+                &meta_file,
+                format!("id={id}\ndeleted_at_secs={timestamp}\nkind=file\noutcome=central\noriginal_path_hex={original_hex}\ntrashed_path_hex={trashed_hex}\n"),
+            )
+            .unwrap();
+
+            (trash_file, meta_file)
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+            unsafe { std::env::remove_var("SURE_RM_ROOT") };
+            unsafe { std::env::remove_var("SURE_RM_TTL") };
+        }
+    }
+
+    #[test]
+    fn purge_expired_records_removes_old_entries() {
+        let env = TestEnv::new("ttl-expired");
+        unsafe { std::env::set_var("SURE_RM_TTL", "1d") };
+        let (trash_file, meta_file) = env.add_record("old-file", 86401);
+
+        let purged = super::purge_expired_records().unwrap();
+        assert_eq!(purged.len(), 1);
+        assert!(!trash_file.exists());
+        assert!(!meta_file.exists());
+    }
+
+    #[test]
+    fn purge_expired_keeps_fresh_entries() {
+        let env = TestEnv::new("ttl-fresh");
+        unsafe { std::env::set_var("SURE_RM_TTL", "7d") };
+        let (trash_file, meta_file) = env.add_record("fresh-file", 100);
+
+        let purged = super::purge_expired_records().unwrap();
+        assert!(purged.is_empty());
+        assert!(trash_file.exists());
+        assert!(meta_file.exists());
+    }
+
+    #[test]
+    fn purge_expired_does_nothing_without_ttl() {
+        let _env = TestEnv::new("no-ttl");
+        let purged = super::purge_expired_records().unwrap();
+        assert!(purged.is_empty());
+    }
+
     #[test]
     fn purge_cleans_up_corrupted_metadata() {
-        use std::fs;
+        let env = TestEnv::new("corrupted");
 
-        let dir = std::env::temp_dir().join(format!(
-            "sure-rm-test-purge-corrupted-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-
-        // SAFETY: single test mutates this var; no other test depends on it.
-        unsafe { std::env::set_var("SURE_RM_ROOT", &dir) };
-
-        // Create a dummy file in trash
-        let trash = dir.join("trash");
-        fs::create_dir_all(&trash).unwrap();
+        // Manually create a record with a corrupted id
+        let trash = env.dir.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
         let trash_file = trash.join("bad-id");
-        fs::write(&trash_file, "data").unwrap();
+        std::fs::write(&trash_file, "data").unwrap();
 
-        // Write a .meta with a corrupted id containing path traversal
-        let meta = dir.join("meta");
-        fs::create_dir_all(&meta).unwrap();
+        let meta = env.dir.join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
         let meta_file = meta.join("bad-id.meta");
         let original_hex = super::hex_encode_bytes(b"/tmp/orig");
         let trashed_hex = super::hex_encode_path(&trash_file);
-        fs::write(
+        std::fs::write(
             &meta_file,
-            format!(
-                "id=../bad\ndeleted_at_secs=1000\nkind=file\noutcome=central\noriginal_path_hex={original_hex}\ntrashed_path_hex={trashed_hex}\n"
-            ),
+            format!("id=../bad\ndeleted_at_secs=1000\nkind=file\noutcome=central\noriginal_path_hex={original_hex}\ntrashed_path_hex={trashed_hex}\n"),
         )
         .unwrap();
 
-        // list_records should return the record despite the bad id
         let records = super::list_records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, "../bad");
 
-        // delete_record_file uses meta_path from the record, not the corrupted id
         super::delete_record_file(&records[0]).unwrap();
-        assert!(!meta_file.exists(), ".meta file should be cleaned up");
-
-        let _ = fs::remove_dir_all(&dir);
-        unsafe { std::env::remove_var("SURE_RM_ROOT") };
+        assert!(!meta_file.exists());
     }
 }
