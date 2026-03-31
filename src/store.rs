@@ -49,7 +49,6 @@ pub struct TrashRecord {
     pub deleted_at_secs: u64,
     pub kind: EntryKind,
     pub outcome: MoveOutcome,
-    pub meta_path: Option<PathBuf>,
 }
 
 pub fn home_dir() -> io::Result<PathBuf> {
@@ -84,7 +83,6 @@ pub fn move_to_trash(path: &Path) -> io::Result<TrashRecord> {
         deleted_at_secs,
         kind,
         outcome,
-        meta_path: None,
     };
 
     if let Err(error) = write_record(&record) {
@@ -103,8 +101,8 @@ pub fn move_to_trash(path: &Path) -> io::Result<TrashRecord> {
     Ok(record)
 }
 
-pub fn list_records() -> io::Result<Vec<TrashRecord>> {
-    let dir = metadata_dir()?;
+pub fn load_records() -> io::Result<Vec<TrashRecord>> {
+    let dir = metadata_dir_path()?;
     let mut records = Vec::new();
 
     if !dir.exists() {
@@ -120,12 +118,42 @@ pub fn list_records() -> io::Result<Vec<TrashRecord>> {
         }
 
         match read_record_from_path(&path) {
-            Ok(record) => records.push(record),
-            Err(_) => {}
+            Ok(record) if validate_id(&record.id).is_ok() => records.push(record),
+            _ => {}
         }
     }
 
     Ok(records)
+}
+
+/// Remove .meta files with corrupted or invalid IDs.
+pub fn repair_metadata() -> io::Result<usize> {
+    let dir = metadata_dir_path()?;
+    let mut removed = 0;
+
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().and_then(OsStr::to_str) != Some("meta") {
+            continue;
+        }
+
+        let should_remove = match read_record_from_path(&path) {
+            Ok(record) => validate_id(&record.id).is_err(),
+            Err(_) => true,
+        };
+
+        if should_remove && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
 }
 
 fn validate_id(id: &str) -> io::Result<()> {
@@ -140,14 +168,19 @@ fn validate_id(id: &str) -> io::Result<()> {
 
 pub fn read_record(id: &str) -> io::Result<Option<TrashRecord>> {
     validate_id(id)?;
-    let path = metadata_dir()?.join(format!("{id}.meta"));
+    let path = metadata_dir_path()?.join(format!("{id}.meta"));
     if !path.exists() {
         return Ok(None);
     }
     read_record_from_path(&path).map(Some)
 }
 
-pub fn restore(id: &str, destination: Option<&Path>) -> io::Result<PathBuf> {
+pub struct RestoreOutcome {
+    pub path: PathBuf,
+    pub warning: Option<io::Error>,
+}
+
+pub fn restore(id: &str, destination: Option<&Path>) -> io::Result<RestoreOutcome> {
     let record = read_record(id)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown trash id"))?;
 
@@ -167,15 +200,16 @@ pub fn restore(id: &str, destination: Option<&Path>) -> io::Result<PathBuf> {
     }
 
     fs::rename(&record.trashed_path, &target)?;
-    if let Err(error) = delete_record_file(&record) {
-        eprintln!("sure-rm: warning: restored successfully but failed to remove metadata: {error}");
-    }
-    Ok(target)
+    let warning = delete_record(&record.id).err();
+    Ok(RestoreOutcome {
+        path: target,
+        warning,
+    })
 }
 
 pub fn find_latest_record_by_original_path(path: &Path) -> io::Result<Option<TrashRecord>> {
     let target = absolute_path(path)?;
-    let mut records = list_records()?;
+    let mut records = load_records()?;
     records.sort_by(|left, right| {
         right
             .deleted_at_secs
@@ -196,13 +230,6 @@ pub fn delete_record(id: &str) -> io::Result<()> {
     validate_id(id)?;
     let path = metadata_dir()?.join(format!("{id}.meta"));
     remove_meta_file(&path)
-}
-
-pub fn delete_record_file(record: &TrashRecord) -> io::Result<()> {
-    match &record.meta_path {
-        Some(path) => remove_meta_file(path),
-        None => delete_record(&record.id),
-    }
 }
 
 fn remove_meta_file(path: &Path) -> io::Result<()> {
@@ -231,6 +258,11 @@ fn metadata_dir() -> io::Result<PathBuf> {
     let path = trash_root()?.join("meta");
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+/// Return the metadata directory path without creating it.
+fn metadata_dir_path() -> io::Result<PathBuf> {
+    Ok(trash_root()?.join("meta"))
 }
 
 fn sibling_fallback_destination(path: &Path, id: &str) -> io::Result<PathBuf> {
@@ -306,7 +338,6 @@ fn read_record_from_path(path: &Path) -> io::Result<TrashRecord> {
         kind: kind.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing kind"))?,
         outcome: outcome
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing outcome"))?,
-        meta_path: Some(path.to_path_buf()),
     })
 }
 
@@ -426,22 +457,37 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
     }
 }
 
-pub fn ttl_secs() -> Option<u64> {
-    let value = std::env::var_os("SURE_RM_TTL")?;
-    let text = match value.to_str() {
-        Some(t) => t,
-        None => {
-            eprintln!("sure-rm: warning: SURE_RM_TTL is not valid UTF-8, ignoring");
-            return None;
-        }
+pub struct TtlConfig {
+    pub secs: Option<u64>,
+    pub warning: Option<String>,
+}
+
+pub fn ttl_config() -> TtlConfig {
+    let Some(value) = std::env::var_os("SURE_RM_TTL") else {
+        return TtlConfig {
+            secs: None,
+            warning: None,
+        };
+    };
+    let Some(text) = value.to_str() else {
+        return TtlConfig {
+            secs: None,
+            warning: Some("SURE_RM_TTL is not valid UTF-8, ignoring".to_string()),
+        };
     };
     match parse_ttl(text) {
-        TtlResult::Enabled(secs) => Some(secs),
-        TtlResult::Disabled => None,
-        TtlResult::Invalid => {
-            eprintln!("sure-rm: warning: invalid SURE_RM_TTL value: {text}, ignoring");
-            None
-        }
+        TtlResult::Enabled(secs) => TtlConfig {
+            secs: Some(secs),
+            warning: None,
+        },
+        TtlResult::Disabled => TtlConfig {
+            secs: None,
+            warning: None,
+        },
+        TtlResult::Invalid => TtlConfig {
+            secs: None,
+            warning: Some(format!("invalid SURE_RM_TTL value: {text}, ignoring")),
+        },
     }
 }
 
@@ -449,19 +495,6 @@ enum TtlResult {
     Enabled(u64),
     Disabled,
     Invalid,
-}
-
-impl TtlResult {
-    fn as_secs(&self) -> Option<u64> {
-        match self {
-            TtlResult::Enabled(s) => Some(*s),
-            _ => None,
-        }
-    }
-
-    fn is_invalid(&self) -> bool {
-        matches!(self, TtlResult::Invalid)
-    }
 }
 
 fn parse_ttl(text: &str) -> TtlResult {
@@ -494,7 +527,11 @@ fn parse_ttl(text: &str) -> TtlResult {
     }
 }
 
-pub fn purge_record_data(record: &TrashRecord) -> io::Result<()> {
+pub struct PurgeOutcome {
+    pub warning: Option<io::Error>,
+}
+
+pub fn purge_record_data(record: &TrashRecord) -> io::Result<PurgeOutcome> {
     match fs::symlink_metadata(&record.trashed_path) {
         Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
             fs::remove_dir_all(&record.trashed_path)?;
@@ -506,23 +543,28 @@ pub fn purge_record_data(record: &TrashRecord) -> io::Result<()> {
         Err(error) => return Err(error),
     }
 
-    if let Err(error) = delete_record_file(record) {
-        eprintln!(
-            "sure-rm: warning: purged data but failed to remove metadata for {}: {error}",
-            record.id
-        );
-    }
-
-    Ok(())
+    let warning = delete_record(&record.id).err();
+    Ok(PurgeOutcome { warning })
 }
 
-pub fn purge_expired_records() -> io::Result<Vec<TrashRecord>> {
-    let Some(ttl) = ttl_secs() else {
-        return Ok(Vec::new());
+pub struct ExpiredPurgeResult {
+    pub purged: Vec<TrashRecord>,
+    pub warnings: Vec<String>,
+}
+
+pub fn purge_expired_records() -> io::Result<ExpiredPurgeResult> {
+    let config = ttl_config();
+    let mut warnings: Vec<String> = config.warning.into_iter().collect();
+
+    let Some(ttl) = config.secs else {
+        return Ok(ExpiredPurgeResult {
+            purged: Vec::new(),
+            warnings,
+        });
     };
 
     let now = now_secs()?;
-    let records = list_records()?;
+    let records = load_records()?;
     let mut purged = Vec::new();
 
     for record in records {
@@ -530,18 +572,27 @@ pub fn purge_expired_records() -> io::Result<Vec<TrashRecord>> {
             continue;
         };
         if age > ttl {
-            if let Err(error) = purge_record_data(&record) {
-                eprintln!(
-                    "sure-rm: warning: failed to purge expired entry {}: {error}",
-                    record.id
-                );
-            } else {
-                purged.push(record);
+            match purge_record_data(&record) {
+                Ok(outcome) => {
+                    if let Some(error) = outcome.warning {
+                        warnings.push(format!(
+                            "purged {} but failed to remove metadata: {error}",
+                            record.id
+                        ));
+                    }
+                    purged.push(record);
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "failed to purge expired entry {}: {error}",
+                        record.id
+                    ));
+                }
             }
         }
     }
 
-    Ok(purged)
+    Ok(ExpiredPurgeResult { purged, warnings })
 }
 
 #[cfg(test)]
@@ -586,11 +637,14 @@ mod tests {
     }
 
     fn ttl(text: &str) -> Option<u64> {
-        super::parse_ttl(text).as_secs()
+        match super::parse_ttl(text) {
+            super::TtlResult::Enabled(s) => Some(s),
+            _ => None,
+        }
     }
 
     fn ttl_invalid(text: &str) -> bool {
-        super::parse_ttl(text).is_invalid()
+        matches!(super::parse_ttl(text), super::TtlResult::Invalid)
     }
 
     #[test]
@@ -660,8 +714,8 @@ mod tests {
     impl TestEnv {
         fn new(name: &str) -> Self {
             let lock = ENV_LOCK.lock().unwrap();
-            let dir = std::env::temp_dir()
-                .join(format!("sure-rm-test-{name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("sure-rm-test-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             unsafe { std::env::set_var("SURE_RM_ROOT", &dir) };
             unsafe { std::env::remove_var("SURE_RM_TTL") };
@@ -704,8 +758,8 @@ mod tests {
         unsafe { std::env::set_var("SURE_RM_TTL", "1d") };
         let (trash_file, meta_file) = env.add_record("old-file", 86401);
 
-        let purged = super::purge_expired_records().unwrap();
-        assert_eq!(purged.len(), 1);
+        let result = super::purge_expired_records().unwrap();
+        assert_eq!(result.purged.len(), 1);
         assert!(!trash_file.exists());
         assert!(!meta_file.exists());
     }
@@ -716,8 +770,8 @@ mod tests {
         unsafe { std::env::set_var("SURE_RM_TTL", "7d") };
         let (trash_file, meta_file) = env.add_record("fresh-file", 100);
 
-        let purged = super::purge_expired_records().unwrap();
-        assert!(purged.is_empty());
+        let result = super::purge_expired_records().unwrap();
+        assert!(result.purged.is_empty());
         assert!(trash_file.exists());
         assert!(meta_file.exists());
     }
@@ -725,15 +779,14 @@ mod tests {
     #[test]
     fn purge_expired_does_nothing_without_ttl() {
         let _env = TestEnv::new("no-ttl");
-        let purged = super::purge_expired_records().unwrap();
-        assert!(purged.is_empty());
+        let result = super::purge_expired_records().unwrap();
+        assert!(result.purged.is_empty());
     }
 
     #[test]
-    fn purge_cleans_up_corrupted_metadata() {
-        let env = TestEnv::new("corrupted");
+    fn load_records_skips_corrupted_metadata() {
+        let env = TestEnv::new("corrupted-load");
 
-        // Manually create a record with a corrupted id
         let trash = env.dir.join("trash");
         std::fs::create_dir_all(&trash).unwrap();
         let trash_file = trash.join("bad-id");
@@ -750,11 +803,33 @@ mod tests {
         )
         .unwrap();
 
-        let records = super::list_records().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id, "../bad");
+        // load_records skips corrupted entries but does not delete them
+        let records = super::load_records().unwrap();
+        assert!(records.is_empty());
+        assert!(meta_file.exists(), "load_records is read-only");
+    }
 
-        super::delete_record_file(&records[0]).unwrap();
+    #[test]
+    fn repair_metadata_removes_corrupted_entries() {
+        let env = TestEnv::new("corrupted-repair");
+
+        let trash = env.dir.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::write(trash.join("bad-id"), "data").unwrap();
+
+        let meta = env.dir.join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let meta_file = meta.join("bad-id.meta");
+        let original_hex = super::hex_encode_bytes(b"/tmp/orig");
+        let trashed_hex = super::hex_encode_path(&trash.join("bad-id"));
+        std::fs::write(
+            &meta_file,
+            format!("id=../bad\ndeleted_at_secs=1000\nkind=file\noutcome=central\noriginal_path_hex={original_hex}\ntrashed_path_hex={trashed_hex}\n"),
+        )
+        .unwrap();
+
+        let removed = super::repair_metadata().unwrap();
+        assert_eq!(removed, 1);
         assert!(!meta_file.exists());
     }
 }

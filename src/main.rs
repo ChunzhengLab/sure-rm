@@ -1,7 +1,6 @@
 mod cli;
 mod store;
 
-use std::env;
 use std::fs;
 use std::io::{IsTerminal, stderr, stdin};
 use std::os::unix::fs::MetadataExt;
@@ -9,18 +8,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 
-use cli::{Command, DeleteOptions, PurgeOptions, RequestedMode, RestoreOptions, UnlinkOptions};
+use cli::{
+    Command, DeleteOptions, Invocation, PurgeOptions, RequestedMode, RestoreOptions, SureBypass,
+    UnlinkOptions,
+};
 use store::{MoveOutcome, TrashRecord};
-
-trait FmtErr<T> {
-    fn fmt_err(self) -> Result<T, String>;
-}
-
-impl<T, E: std::fmt::Display> FmtErr<T> for Result<T, E> {
-    fn fmt_err(self) -> Result<T, String> {
-        self.map_err(|e| e.to_string())
-    }
-}
 
 enum DeleteResult {
     PermanentlyDeleted(PathBuf),
@@ -33,20 +25,16 @@ enum EffectiveMode {
     Batch,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct SureBypass {
-    program: &'static str,
-    args: Vec<std::ffi::OsString>,
-}
-
 fn main() -> ExitCode {
-    if let Err(message) = maybe_exec_sure_bypass() {
-        eprintln!("sure-rm: {message}");
-        return ExitCode::from(1);
-    }
-
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    match cli::parse_invocation() {
+        Ok(Invocation::Bypass(bypass)) => exec_bypass(bypass),
+        Ok(Invocation::Command(command)) => match run(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("sure-rm: {message}");
+                ExitCode::from(1)
+            }
+        },
         Err(message) => {
             eprintln!("sure-rm: {message}");
             ExitCode::from(1)
@@ -54,8 +42,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
-    match cli::parse_args()? {
+fn exec_bypass(bypass: SureBypass) -> ExitCode {
+    let error = ProcessCommand::new(bypass.program)
+        .args(&bypass.args)
+        .exec();
+    eprintln!("sure-rm: failed to exec {}: {}", bypass.program, error);
+    ExitCode::from(1)
+}
+
+fn run(command: Command) -> Result<(), String> {
+    match command {
         Command::Delete(options) => run_delete(options),
         Command::List => run_list(),
         Command::Restore(options) => run_restore(options),
@@ -66,126 +62,6 @@ fn run() -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-fn maybe_exec_sure_bypass() -> Result<(), String> {
-    let argv: Vec<std::ffi::OsString> = env::args_os().collect();
-
-    let Some(bypass) = build_sure_bypass(&argv) else {
-        return Ok(());
-    };
-
-    let error = ProcessCommand::new(bypass.program)
-        .args(&bypass.args)
-        .exec();
-
-    Err(format!("failed to exec {}: {}", bypass.program, error))
-}
-
-fn is_non_bypass_subcommand(arg: Option<&std::ffi::OsString>) -> bool {
-    matches!(
-        arg.and_then(|a| a.to_str()),
-        Some("list" | "restore" | "purge" | "help" | "--help")
-    )
-}
-
-fn has_sure_flag(args: &[std::ffi::OsString]) -> bool {
-    for arg in args {
-        if arg == "--" {
-            return false;
-        }
-        if arg == "--sure" {
-            return true;
-        }
-        if let Some(text) = arg.to_str() {
-            if text.starts_with('-') && !text.starts_with("--") && text.contains('s') {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn build_sure_bypass(argv: &[std::ffi::OsString]) -> Option<SureBypass> {
-    if argv.len() <= 1 || !has_sure_flag(&argv[1..]) {
-        return None;
-    }
-
-    // --sure bypass only applies to delete and unlink operations.
-    // Anything recognized as a subcommand is excluded. When adding a new
-    // subcommand to cli::parse_args, add it here too so it won't bypass.
-    if is_non_bypass_subcommand(argv.get(1)) {
-        return None;
-    }
-
-    if cli::invoked_as_unlink(argv.first()) {
-        return Some(SureBypass {
-            program: "/bin/unlink",
-            args: filter_passthrough_args(&argv[1..]),
-        });
-    }
-
-    let invoked_subcommand_unlink = argv.get(1).and_then(|arg| arg.to_str()) == Some("unlink");
-    let (program, args) = if invoked_subcommand_unlink {
-        ("/bin/unlink", filter_passthrough_args(&argv[2..]))
-    } else {
-        ("/bin/rm", filter_passthrough_args(&argv[1..]))
-    };
-
-    Some(SureBypass { program, args })
-}
-
-fn filter_passthrough_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
-    let mut filtered = Vec::new();
-    let mut parsing_options = true;
-    let mut skip_mode_value = false;
-
-    for arg in args {
-        if skip_mode_value {
-            skip_mode_value = false;
-            continue;
-        }
-
-        if parsing_options {
-            if arg == "--sure" {
-                continue;
-            }
-
-            if arg == "--" {
-                parsing_options = false;
-                filtered.push(arg.clone());
-                continue;
-            }
-
-            if arg == "--mode" {
-                skip_mode_value = true;
-                continue;
-            }
-
-            if let Some(text) = arg.to_str()
-                && text.starts_with("--mode=")
-            {
-                continue;
-            }
-
-            // Strip -s from combined short flags, keep the rest
-            if let Some(text) = arg.to_str()
-                && text.starts_with('-')
-                && !text.starts_with("--")
-                && text.contains('s')
-            {
-                let remaining: String = text[1..].chars().filter(|&c| c != 's').collect();
-                if !remaining.is_empty() {
-                    filtered.push(std::ffi::OsString::from(format!("-{remaining}")));
-                }
-                continue;
-            }
-        }
-
-        filtered.push(arg.clone());
-    }
-
-    filtered
 }
 
 fn run_unlink(options: UnlinkOptions) -> Result<(), String> {
@@ -216,7 +92,7 @@ fn run_delete(options: DeleteOptions) -> Result<(), String> {
     let prompt_once = options.interactive_once
         || (mode == EffectiveMode::Interactive
             && should_auto_prompt_once(&options)
-            && paths_warrant_prompt(&options.paths));
+            && paths_need_prompt(&options.paths));
 
     if prompt_once {
         let prompt = format!(
@@ -296,7 +172,7 @@ fn delete_one(path: &Path, options: &DeleteOptions) -> Result<Option<DeleteResul
     store::move_to_trash(path)
         .map(DeleteResult::Trashed)
         .map(Some)
-        .fmt_err()
+        .map_err(|e| e.to_string())
 }
 
 fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
@@ -312,13 +188,13 @@ fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<(), S
         return Ok(());
     }
 
-    let canonical_target = fs::canonicalize(path).fmt_err()?;
-    let cwd = std::env::current_dir().fmt_err()?;
-    let canonical_cwd = fs::canonicalize(&cwd).fmt_err()?;
-    let home = store::home_dir().fmt_err()?;
+    let canonical_target = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let canonical_cwd = fs::canonicalize(&cwd).map_err(|e| e.to_string())?;
+    let home = store::home_dir().map_err(|e| e.to_string())?;
     let canonical_home = fs::canonicalize(&home).unwrap_or(home);
 
-    if canonical_target == PathBuf::from("/") {
+    if canonical_target == Path::new("/") {
         return Err("refusing to remove /".to_string());
     }
 
@@ -329,16 +205,14 @@ fn reject_dangerous_target(path: &Path, metadata: &fs::Metadata) -> Result<(), S
     }
 
     if canonical_target == canonical_home || canonical_home.starts_with(&canonical_target) {
-        return Err(
-            "refusing to remove the home directory or one of its parents".to_string(),
-        );
+        return Err("refusing to remove the home directory or one of its parents".to_string());
     }
 
     Ok(())
 }
 
 fn ensure_directory_is_empty(path: &Path) -> Result<(), String> {
-    let mut entries = fs::read_dir(path).fmt_err()?;
+    let mut entries = fs::read_dir(path).map_err(|e| e.to_string())?;
     if entries.next().is_some() {
         Err("directory not empty".to_string())
     } else {
@@ -347,7 +221,7 @@ fn ensure_directory_is_empty(path: &Path) -> Result<(), String> {
 }
 
 fn ensure_same_file_system_tree(path: &Path, expected_dev: u64) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path).fmt_err()?;
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if metadata.dev() != expected_dev {
         return Err(format!(
             "cross-device entry blocked by -x: {}",
@@ -359,8 +233,8 @@ fn ensure_same_file_system_tree(path: &Path, expected_dev: u64) -> Result<(), St
         return Ok(());
     }
 
-    for entry in fs::read_dir(path).fmt_err()? {
-        let entry = entry.fmt_err()?;
+    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
         let child_path = entry.path();
         ensure_same_file_system_tree(&child_path, expected_dev)?;
     }
@@ -375,24 +249,32 @@ fn permanently_delete(
 ) -> Result<(), String> {
     if !metadata.file_type().is_symlink() && metadata.is_dir() {
         if options.recursive {
-            fs::remove_dir_all(path).fmt_err()
+            fs::remove_dir_all(path).map_err(|e| e.to_string())
         } else if options.allow_dir {
-            fs::remove_dir(path).fmt_err()
+            fs::remove_dir(path).map_err(|e| e.to_string())
         } else {
             Err("is a directory (use -r, -R, or -d)".to_string())
         }
     } else {
-        fs::remove_file(path).fmt_err()
+        fs::remove_file(path).map_err(|e| e.to_string())
     }
 }
 
 fn run_list() -> Result<(), String> {
-    let purged = store::purge_expired_records().fmt_err()?;
-    for record in &purged {
+    let repaired = store::repair_metadata().map_err(|e| e.to_string())?;
+    if repaired > 0 {
+        eprintln!("sure-rm: repaired {repaired} corrupted metadata entries");
+    }
+
+    let expired = store::purge_expired_records().map_err(|e| e.to_string())?;
+    for warning in &expired.warnings {
+        eprintln!("sure-rm: {warning}");
+    }
+    for record in &expired.purged {
         eprintln!("sure-rm: expired (TTL): {}", record.original_path.display());
     }
 
-    let mut records = store::list_records().fmt_err()?;
+    let mut records = store::load_records().map_err(|e| e.to_string())?;
     if records.is_empty() {
         println!("sure-rm trash is empty");
         return Ok(());
@@ -413,50 +295,62 @@ fn run_list() -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_record(input: &str) -> Result<TrashRecord, String> {
-    if let Ok(Some(record)) = store::read_record(input) {
-        return Ok(record);
+fn resolve_record(query: &str) -> Result<TrashRecord, String> {
+    match store::read_record(query) {
+        Ok(Some(record)) => return Ok(record),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(e) => return Err(e.to_string()),
+        Ok(None) => {}
     }
-    let path = PathBuf::from(input);
-    store::find_latest_record_by_original_path(&path)
-        .fmt_err()?
-        .ok_or_else(|| format!("not found in trash: {input}"))
+    store::find_latest_record_by_original_path(Path::new(query))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("not found in trash: {query}"))
 }
 
 fn run_restore(options: RestoreOptions) -> Result<(), String> {
-    let record = resolve_record(&options.id)?;
-    let restored_path = store::restore(&record.id, options.destination.as_deref()).fmt_err()?;
-    println!("restored {}", restored_path.display());
+    let record = resolve_record(&options.query)?;
+    let outcome =
+        store::restore(&record.id, options.destination.as_deref()).map_err(|e| e.to_string())?;
+    if let Some(error) = &outcome.warning {
+        eprintln!("sure-rm: warning: restored but failed to remove metadata: {error}");
+    }
+    println!("restored {}", outcome.path.display());
     Ok(())
 }
 
 fn run_purge(options: PurgeOptions) -> Result<(), String> {
     if options.all {
-        let records = store::list_records().fmt_err()?;
+        let records = store::load_records().map_err(|e| e.to_string())?;
         for record in records {
             purge_record(&record)?;
         }
         return Ok(());
     }
 
-    if options.ids.is_empty() {
-        return Err("purge requires at least one id or --all".to_string());
+    if options.queries.is_empty() {
+        return Err("purge requires at least one id/path or --all".to_string());
     }
 
-    for id in &options.ids {
-        purge_record(&resolve_record(id)?)?;
+    for query in &options.queries {
+        purge_record(&resolve_record(query)?)?;
     }
 
     Ok(())
 }
 
 fn purge_record(record: &TrashRecord) -> Result<(), String> {
-    store::purge_record_data(record).fmt_err()?;
+    let outcome = store::purge_record_data(record).map_err(|e| e.to_string())?;
+    if let Some(error) = &outcome.warning {
+        eprintln!(
+            "sure-rm: warning: purged {} but failed to remove metadata: {error}",
+            record.id
+        );
+    }
     println!("purged {}", record.id);
     Ok(())
 }
 
-fn paths_warrant_prompt(paths: &[PathBuf]) -> bool {
+fn paths_need_prompt(paths: &[PathBuf]) -> bool {
     if paths.len() > 3 {
         return true;
     }
@@ -497,12 +391,12 @@ fn confirm(prompt: &str) -> Result<bool, String> {
     use std::io::{self, Write};
 
     eprint!("{prompt} [y/N] ");
-    io::stderr().flush().fmt_err()?;
+    io::stderr().flush().map_err(|e| e.to_string())?;
 
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
-        .fmt_err()?;
+        .map_err(|e| e.to_string())?;
 
     let answer = input.trim();
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
@@ -530,51 +424,8 @@ fn print_delete_result(result: DeleteResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EffectiveMode, SureBypass, build_sure_bypass, filter_passthrough_args, resolve_mode,
-        should_auto_prompt_once,
-    };
+    use super::{EffectiveMode, resolve_mode, should_auto_prompt_once};
     use crate::cli::{DeleteOptions, RequestedMode};
-    use std::ffi::OsString;
-
-    #[test]
-    fn sure_after_double_dash_does_not_trigger_bypass() {
-        let bypass = build_sure_bypass(&[
-            OsString::from("sure-rm"),
-            OsString::from("--"),
-            OsString::from("--sure"),
-        ]);
-
-        assert!(bypass.is_none());
-    }
-
-    #[test]
-    fn sure_before_double_dash_still_triggers_bypass() {
-        let bypass = build_sure_bypass(&[
-            OsString::from("sure-rm"),
-            OsString::from("--sure"),
-            OsString::from("--"),
-            OsString::from("file"),
-        ]);
-
-        assert!(bypass.is_some());
-    }
-
-    #[test]
-    fn sure_bypass_skips_non_delete_subcommands() {
-        for subcommand in &["list", "restore", "purge", "help", "--help"] {
-            let bypass = build_sure_bypass(&[
-                OsString::from("sure-rm"),
-                OsString::from(*subcommand),
-                OsString::from("--sure"),
-            ]);
-
-            assert!(
-                bypass.is_none(),
-                "bypass should not trigger for {subcommand}"
-            );
-        }
-    }
 
     #[test]
     fn auto_prompt_once_for_recursive_delete() {
@@ -582,7 +433,6 @@ mod tests {
             recursive: true,
             ..DeleteOptions::default()
         };
-
         assert!(should_auto_prompt_once(&options));
     }
 
@@ -593,7 +443,6 @@ mod tests {
             force: true,
             ..DeleteOptions::default()
         };
-
         assert!(!should_auto_prompt_once(&options));
     }
 
@@ -612,105 +461,6 @@ mod tests {
             force: true,
             ..DeleteOptions::default()
         };
-
         assert!(super::run_delete(options).is_ok());
-    }
-
-    #[test]
-    fn sure_bypass_uses_rm_and_strips_sure_rm_flags() {
-        let bypass = build_sure_bypass(&[
-            OsString::from("sure-rm"),
-            OsString::from("--mode"),
-            OsString::from("interactive"),
-            OsString::from("--sure"),
-            OsString::from("-rf"),
-            OsString::from("target"),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            bypass,
-            SureBypass {
-                program: "/bin/rm",
-                args: vec![OsString::from("-rf"), OsString::from("target")],
-            }
-        );
-    }
-
-    #[test]
-    fn sure_bypass_uses_unlink_for_subcommand() {
-        let bypass = build_sure_bypass(&[
-            OsString::from("sure-rm"),
-            OsString::from("unlink"),
-            OsString::from("--sure"),
-            OsString::from("--"),
-            OsString::from("-file"),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            bypass,
-            SureBypass {
-                program: "/bin/unlink",
-                args: vec![OsString::from("--"), OsString::from("-file")],
-            }
-        );
-    }
-
-    #[test]
-    fn short_s_triggers_sure_bypass() {
-        let bypass = build_sure_bypass(&[
-            OsString::from("sure-rm"),
-            OsString::from("-sf"),
-            OsString::from("target"),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            bypass,
-            SureBypass {
-                program: "/bin/rm",
-                args: vec![OsString::from("-f"), OsString::from("target")],
-            }
-        );
-    }
-
-    #[test]
-    fn short_s_alone_triggers_sure_bypass() {
-        let bypass = build_sure_bypass(&[
-            OsString::from("sure-rm"),
-            OsString::from("-s"),
-            OsString::from("target"),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            bypass,
-            SureBypass {
-                program: "/bin/rm",
-                args: vec![OsString::from("target")],
-            }
-        );
-    }
-
-    #[test]
-    fn filter_passthrough_args_keeps_operands_after_double_dash() {
-        let filtered = filter_passthrough_args(&[
-            OsString::from("--mode=interactive"),
-            OsString::from("--"),
-            OsString::from("--mode"),
-            OsString::from("--sure"),
-            OsString::from("file"),
-        ]);
-
-        assert_eq!(
-            filtered,
-            vec![
-                OsString::from("--"),
-                OsString::from("--mode"),
-                OsString::from("--sure"),
-                OsString::from("file"),
-            ]
-        );
     }
 }

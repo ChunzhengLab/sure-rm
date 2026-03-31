@@ -3,6 +3,18 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
+pub enum Invocation {
+    Command(Command),
+    Bypass(SureBypass),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct SureBypass {
+    pub program: &'static str,
+    pub args: Vec<OsString>,
+}
+
+#[derive(Debug)]
 pub enum Command {
     Delete(DeleteOptions),
     List,
@@ -70,14 +82,14 @@ pub struct DeleteOptions {
 
 #[derive(Debug)]
 pub struct RestoreOptions {
-    pub id: String,
+    pub query: String,
     pub destination: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
 pub struct PurgeOptions {
     pub all: bool,
-    pub ids: Vec<String>,
+    pub queries: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -85,55 +97,187 @@ pub struct UnlinkOptions {
     pub path: PathBuf,
 }
 
-pub fn parse_args() -> Result<Command, String> {
+pub fn parse_invocation() -> Result<Invocation, String> {
     let mut args = env::args_os();
     let program = args.next();
-    let rest: Vec<OsString> = args.collect();
+    let argv: Vec<OsString> = args.collect();
 
-    if invoked_as_unlink(program.as_ref()) {
-        return parse_unlink(rest);
+    // Strip --mode before bypass check so that alias scenarios like
+    // `alias rm='sure-rm --mode interactive'` + `rm list --sure`
+    // correctly see "list" as the first real arg, not "--mode".
+    let (leading_mode, rest) = split_leading_mode(argv)?;
+
+    if let Some(bypass) = build_sure_bypass(program.as_ref(), &rest) {
+        return Ok(Invocation::Bypass(bypass));
     }
 
-    // Strip leading --mode/--mode=... so subcommands work with aliases
-    // like `alias rm='sure-rm --mode interactive'`.
-    // The mode value is preserved and re-injected for delete commands.
-    let mut rest = rest;
-    let mut leading_mode: Vec<OsString> = Vec::new();
+    let command = if invoked_as_unlink(program.as_ref()) {
+        parse_unlink(rest)
+    } else {
+        parse_command(leading_mode, rest)
+    }?;
+
+    Ok(Invocation::Command(command))
+}
+
+fn parse_command(leading_mode: Vec<OsString>, rest: Vec<OsString>) -> Result<Command, String> {
+    if rest.is_empty() {
+        return Ok(Command::Help(HelpTopic::General));
+    }
+
+    match classify_first_arg(rest.first()) {
+        FirstArg::Subcommand("help" | "--help" | "-h") => Ok(Command::Help(HelpTopic::General)),
+        FirstArg::Subcommand("unlink") => parse_unlink(rest[1..].to_vec()),
+        FirstArg::Subcommand("list") => parse_list(rest[1..].to_vec()),
+        FirstArg::Subcommand("restore") => parse_restore(rest[1..].to_vec()),
+        FirstArg::Subcommand("purge") => parse_purge(rest[1..].to_vec()),
+        FirstArg::Subcommand(_) => unreachable!(),
+        FirstArg::DeleteOrPath => {
+            let mut delete_args = leading_mode;
+            delete_args.extend(rest);
+            parse_delete(delete_args)
+        }
+    }
+}
+
+fn split_leading_mode(argv: Vec<OsString>) -> Result<(Vec<OsString>, Vec<OsString>), String> {
+    let mut rest = argv;
+    let mut mode_args: Vec<OsString> = Vec::new();
     loop {
         let Some(first) = rest.first() else {
-            return Ok(Command::Help(HelpTopic::General));
+            break;
         };
         if let Some(text) = first.to_str() {
             if text == "--mode" {
                 if rest.len() < 2 {
                     return Err("missing value after --mode".to_string());
                 }
-                leading_mode.extend(rest.drain(..2));
+                mode_args.extend(rest.drain(..2));
                 continue;
             }
             if text.starts_with("--mode=") {
-                leading_mode.push(rest.remove(0));
+                mode_args.push(rest.remove(0));
                 continue;
             }
         }
         break;
     }
+    Ok((mode_args, rest))
+}
 
-    let first = rest[0].clone();
+enum FirstArg<'a> {
+    Subcommand(&'a str),
+    DeleteOrPath,
+}
 
-    match first.to_str() {
-        Some("help") => Ok(Command::Help(HelpTopic::General)),
-        Some("--help") | Some("-h") => Ok(Command::Help(HelpTopic::General)),
-        Some("unlink") => parse_unlink(rest[1..].to_vec()),
-        Some("list") => parse_list(rest[1..].to_vec()),
-        Some("restore") => parse_restore(rest[1..].to_vec()),
-        Some("purge") => parse_purge(rest[1..].to_vec()),
-        _ => {
-            let mut delete_args = leading_mode;
-            delete_args.extend(rest);
-            parse_delete(delete_args)
+fn classify_first_arg(arg: Option<&OsString>) -> FirstArg<'_> {
+    match arg.and_then(|a| a.to_str()) {
+        Some(name @ ("help" | "--help" | "-h" | "list" | "restore" | "purge" | "unlink")) => {
+            FirstArg::Subcommand(name)
+        }
+        _ => FirstArg::DeleteOrPath,
+    }
+}
+
+fn has_sure_flag(args: &[OsString]) -> bool {
+    for arg in args {
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--sure" {
+            return true;
+        }
+        if let Some(text) = arg.to_str()
+            && text.starts_with('-')
+            && !text.starts_with("--")
+            && text.contains('s')
+        {
+            return true;
         }
     }
+    false
+}
+
+pub fn build_sure_bypass(program: Option<&OsString>, argv: &[OsString]) -> Option<SureBypass> {
+    if argv.is_empty() || !has_sure_flag(argv) {
+        return None;
+    }
+
+    // Bypass only applies to delete and unlink, not to other subcommands.
+    if let FirstArg::Subcommand(name) = classify_first_arg(argv.first())
+        && name != "unlink"
+    {
+        return None;
+    }
+
+    if invoked_as_unlink(program) {
+        return Some(SureBypass {
+            program: "/bin/unlink",
+            args: filter_passthrough_args(argv),
+        });
+    }
+
+    let is_unlink_subcommand = argv.first().and_then(|a| a.to_str()) == Some("unlink");
+    let (program, args) = if is_unlink_subcommand {
+        ("/bin/unlink", filter_passthrough_args(&argv[1..]))
+    } else {
+        ("/bin/rm", filter_passthrough_args(argv))
+    };
+
+    Some(SureBypass { program, args })
+}
+
+pub fn filter_passthrough_args(args: &[OsString]) -> Vec<OsString> {
+    let mut filtered = Vec::new();
+    let mut parsing_options = true;
+    let mut skip_mode_value = false;
+
+    for arg in args {
+        if skip_mode_value {
+            skip_mode_value = false;
+            continue;
+        }
+
+        if parsing_options {
+            if arg == "--sure" {
+                continue;
+            }
+
+            if arg == "--" {
+                parsing_options = false;
+                filtered.push(arg.clone());
+                continue;
+            }
+
+            if arg == "--mode" {
+                skip_mode_value = true;
+                continue;
+            }
+
+            if let Some(text) = arg.to_str()
+                && text.starts_with("--mode=")
+            {
+                continue;
+            }
+
+            // Strip -s from combined short flags, keep the rest
+            if let Some(text) = arg.to_str()
+                && text.starts_with('-')
+                && !text.starts_with("--")
+                && text.contains('s')
+            {
+                let remaining: String = text[1..].chars().filter(|&c| c != 's').collect();
+                if !remaining.is_empty() {
+                    filtered.push(OsString::from(format!("-{remaining}")));
+                }
+                continue;
+            }
+        }
+
+        filtered.push(arg.clone());
+    }
+
+    filtered
 }
 
 pub fn usage() -> String {
@@ -239,7 +383,7 @@ fn parse_list(args: Vec<OsString>) -> Result<Command, String> {
 }
 
 fn parse_restore(args: Vec<OsString>) -> Result<Command, String> {
-    let mut id: Option<String> = None;
+    let mut query: Option<String> = None;
     let mut destination: Option<PathBuf> = None;
     let mut iter = args.into_iter();
 
@@ -256,17 +400,17 @@ fn parse_restore(args: Vec<OsString>) -> Result<Command, String> {
                 return Err(format!("unknown restore option: {value}"));
             }
             Some(value) => {
-                if id.is_some() {
-                    return Err("restore accepts exactly one id".to_string());
+                if query.is_some() {
+                    return Err("restore accepts exactly one id or path".to_string());
                 }
-                id = Some(value.to_string());
+                query = Some(value.to_string());
             }
             None => return Err("restore arguments must be valid UTF-8".to_string()),
         }
     }
 
-    let id = id.ok_or_else(|| "restore requires an id".to_string())?;
-    Ok(Command::Restore(RestoreOptions { id, destination }))
+    let query = query.ok_or_else(|| "restore requires an id or path".to_string())?;
+    Ok(Command::Restore(RestoreOptions { query, destination }))
 }
 
 fn parse_purge(args: Vec<OsString>) -> Result<Command, String> {
@@ -279,7 +423,7 @@ fn parse_purge(args: Vec<OsString>) -> Result<Command, String> {
             Some(value) if value.starts_with('-') => {
                 return Err(format!("unknown purge option: {value}"));
             }
-            Some(value) => options.ids.push(value.to_string()),
+            Some(value) => options.queries.push(value.to_string()),
             None => return Err("purge arguments must be valid UTF-8".to_string()),
         }
     }
@@ -338,57 +482,55 @@ fn parse_delete(args: Vec<OsString>) -> Result<Command, String> {
             continue;
         }
 
-        if parsing_options {
-            if let Some(text) = arg.to_str() {
-                if let Some(value) = text.strip_prefix("--mode=") {
-                    options.mode = RequestedMode::parse(value)?;
-                    continue;
-                }
+        if parsing_options && let Some(text) = arg.to_str() {
+            if let Some(value) = text.strip_prefix("--mode=") {
+                options.mode = RequestedMode::parse(value)?;
+                continue;
+            }
 
-                if text == "--mode" {
-                    let Some(value) = iter.next() else {
-                        return Err("missing value after --mode".to_string());
-                    };
-                    let value = value
-                        .to_str()
-                        .ok_or_else(|| "mode must be valid UTF-8".to_string())?;
-                    options.mode = RequestedMode::parse(value)?;
-                    continue;
-                }
+            if text == "--mode" {
+                let Some(value) = iter.next() else {
+                    return Err("missing value after --mode".to_string());
+                };
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| "mode must be valid UTF-8".to_string())?;
+                options.mode = RequestedMode::parse(value)?;
+                continue;
+            }
 
-                if text.starts_with("--") {
-                    return Err(format!("unknown option: {text}"));
-                }
+            if text.starts_with("--") {
+                return Err(format!("unknown option: {text}"));
+            }
 
-                if text.starts_with('-') && text.len() > 1 {
-                    for short in text[1..].chars() {
-                        match short {
-                            'd' => options.allow_dir = true,
-                            'r' | 'R' => options.recursive = true,
-                            'f' => {
-                                options.force = true;
-                                options.interactive_each = false;
-                            }
-                            'i' => {
-                                options.interactive_each = true;
-                                options.force = false;
-                            }
-                            'I' => options.interactive_once = true,
-                            'x' => options.one_file_system = true,
-                            'p' => options.permanent = true,
-                            'v' => options.verbose = true,
-                            'W' => {
-                                return Err(
-                                    "sure-rm no longer supports -W; use `sure-rm restore` instead"
-                                        .to_string(),
-                                );
-                            }
-                            'h' => return Ok(Command::Help(HelpTopic::General)),
-                            _ => return Err(format!("unknown option: -{short}")),
+            if text.starts_with('-') && text.len() > 1 {
+                for short in text[1..].chars() {
+                    match short {
+                        'd' => options.allow_dir = true,
+                        'r' | 'R' => options.recursive = true,
+                        'f' => {
+                            options.force = true;
+                            options.interactive_each = false;
                         }
+                        'i' => {
+                            options.interactive_each = true;
+                            options.force = false;
+                        }
+                        'I' => options.interactive_once = true,
+                        'x' => options.one_file_system = true,
+                        'p' => options.permanent = true,
+                        'v' => options.verbose = true,
+                        'W' => {
+                            return Err(
+                                "sure-rm no longer supports -W; use `sure-rm restore` instead"
+                                    .to_string(),
+                            );
+                        }
+                        'h' => return Ok(Command::Help(HelpTopic::General)),
+                        _ => return Err(format!("unknown option: -{short}")),
                     }
-                    continue;
                 }
+                continue;
             }
         }
 
@@ -400,12 +542,15 @@ fn parse_delete(args: Vec<OsString>) -> Result<Command, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, RequestedMode, invoked_as_unlink, parse_delete, parse_unlink};
+    use super::{
+        Command, RequestedMode, SureBypass, build_sure_bypass, filter_passthrough_args,
+        invoked_as_unlink, parse_delete, parse_unlink,
+    };
     use std::ffi::OsString;
     use std::path::PathBuf;
 
     fn os(args: &[&str]) -> Vec<OsString> {
-        args.iter().map(|s| OsString::from(s)).collect()
+        args.iter().map(OsString::from).collect()
     }
 
     #[test]
@@ -488,5 +633,90 @@ mod tests {
         assert!(!invoked_as_unlink(Some(&OsString::from(
             "/usr/local/bin/sure-rm"
         ))));
+    }
+
+    fn bypass(args: &[&str]) -> Option<SureBypass> {
+        let argv = os(args);
+        build_sure_bypass(None, &argv)
+    }
+
+    #[test]
+    fn sure_after_double_dash_does_not_trigger_bypass() {
+        assert!(bypass(&["--", "--sure"]).is_none());
+    }
+
+    #[test]
+    fn sure_before_double_dash_still_triggers_bypass() {
+        assert!(bypass(&["--sure", "--", "file"]).is_some());
+    }
+
+    #[test]
+    fn sure_bypass_skips_non_delete_subcommands() {
+        for sub in &["list", "restore", "purge", "help", "--help"] {
+            assert!(
+                bypass(&[sub, "--sure"]).is_none(),
+                "should not bypass for {sub}"
+            );
+        }
+    }
+
+    #[test]
+    fn sure_bypass_uses_rm_and_strips_sure_rm_flags() {
+        let b = bypass(&["--mode", "interactive", "--sure", "-rf", "target"]).unwrap();
+        assert_eq!(
+            b,
+            SureBypass {
+                program: "/bin/rm",
+                args: os(&["-rf", "target"]),
+            }
+        );
+    }
+
+    #[test]
+    fn sure_bypass_uses_unlink_for_subcommand() {
+        let b = bypass(&["unlink", "--sure", "--", "-file"]).unwrap();
+        assert_eq!(
+            b,
+            SureBypass {
+                program: "/bin/unlink",
+                args: os(&["--", "-file"]),
+            }
+        );
+    }
+
+    #[test]
+    fn short_s_triggers_sure_bypass() {
+        let b = bypass(&["-sf", "target"]).unwrap();
+        assert_eq!(
+            b,
+            SureBypass {
+                program: "/bin/rm",
+                args: os(&["-f", "target"]),
+            }
+        );
+    }
+
+    #[test]
+    fn short_s_alone_triggers_sure_bypass() {
+        let b = bypass(&["-s", "target"]).unwrap();
+        assert_eq!(
+            b,
+            SureBypass {
+                program: "/bin/rm",
+                args: os(&["target"]),
+            }
+        );
+    }
+
+    #[test]
+    fn filter_passthrough_args_keeps_operands_after_double_dash() {
+        let filtered = filter_passthrough_args(&os(&[
+            "--mode=interactive",
+            "--",
+            "--mode",
+            "--sure",
+            "file",
+        ]));
+        assert_eq!(filtered, os(&["--", "--mode", "--sure", "file"]));
     }
 }
