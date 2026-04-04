@@ -1,6 +1,8 @@
 # sure-rm
 
-[English](README.md)
+[![build](https://github.com/ChunzhengLab/sure-rm/actions/workflows/rust.yml/badge.svg)](https://github.com/ChunzhengLab/sure-rm/actions/workflows/rust.yml) [![version](https://img.shields.io/github/v/tag/ChunzhengLab/sure-rm?label=version)](https://github.com/ChunzhengLab/sure-rm/releases) [![license](https://img.shields.io/github/license/ChunzhengLab/sure-rm)](LICENSE)
+
+[English](README.md) | 中文
 
 `sure-rm` 是一个用 Rust 编写的命令行工具，使用习惯和系统自带的 `rm` 基本一致。
 

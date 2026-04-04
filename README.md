@@ -1,6 +1,8 @@
 # sure-rm
 
-[中文](README.zh-cn.md)
+[![build](https://github.com/ChunzhengLab/sure-rm/actions/workflows/rust.yml/badge.svg)](https://github.com/ChunzhengLab/sure-rm/actions/workflows/rust.yml) [![version](https://img.shields.io/github/v/tag/ChunzhengLab/sure-rm?label=version)](https://github.com/ChunzhengLab/sure-rm/releases) [![license](https://img.shields.io/github/license/ChunzhengLab/sure-rm)](LICENSE)
+
+English | [中文](README.zh-cn.md)
 
 `sure-rm` is a command-line tool written in Rust. It works just like the system `rm`.
 
