@@ -174,9 +174,10 @@ enum FirstArg<'a> {
 
 fn classify_first_arg(arg: Option<&OsString>) -> FirstArg<'_> {
     match arg.and_then(|a| a.to_str()) {
-        Some(name @ ("help" | "--help" | "-h" | "--version" | "list" | "restore" | "purge" | "unlink")) => {
-            FirstArg::Subcommand(name)
-        }
+        Some(
+            name @ ("help" | "--help" | "-h" | "--version" | "list" | "restore" | "purge"
+            | "unlink"),
+        ) => FirstArg::Subcommand(name),
         _ => FirstArg::DeleteOrPath,
     }
 }
