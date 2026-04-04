@@ -1,4 +1,5 @@
 mod cli;
+mod color;
 mod store;
 
 use std::fs;
@@ -31,12 +32,12 @@ fn main() -> ExitCode {
         Ok(Invocation::Command(command)) => match run(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("sure-rm: {message}");
+                color::print_error(message);
                 ExitCode::from(1)
             }
         },
         Err(message) => {
-            eprintln!("sure-rm: {message}");
+            color::print_error(message);
             ExitCode::from(1)
         }
     }
@@ -46,7 +47,7 @@ fn exec_bypass(bypass: SureBypass) -> ExitCode {
     let error = ProcessCommand::new(bypass.program)
         .args(&bypass.args)
         .exec();
-    eprintln!("sure-rm: failed to exec {}: {}", bypass.program, error);
+    color::print_error(format_args!("failed to exec {}: {error}", bypass.program));
     ExitCode::from(1)
 }
 
@@ -129,7 +130,7 @@ fn run_delete(options: DeleteOptions) -> Result<(), String> {
             Ok(None) => {}
             Err(error) => {
                 had_error = true;
-                eprintln!("sure-rm: {}: {}", path.display(), error);
+                color::print_error(format_args!("{}: {error}", path.display()));
             }
         }
     }
@@ -263,15 +264,20 @@ fn permanently_delete(
 fn run_list() -> Result<(), String> {
     let repaired = store::repair_metadata().map_err(|e| e.to_string())?;
     if repaired > 0 {
-        eprintln!("sure-rm: repaired {repaired} corrupted metadata entries");
+        color::print_warning(format_args!(
+            "repaired {repaired} corrupted metadata entries"
+        ));
     }
 
     let expired = store::purge_expired_records().map_err(|e| e.to_string())?;
     for warning in &expired.warnings {
-        eprintln!("sure-rm: {warning}");
+        color::print_warning(warning);
     }
     for record in &expired.purged {
-        eprintln!("sure-rm: expired (TTL): {}", record.original_path.display());
+        color::print_warning(format_args!(
+            "expired (TTL): {}",
+            record.original_path.display()
+        ));
     }
 
     let mut records = store::load_records().map_err(|e| e.to_string())?;
@@ -312,7 +318,9 @@ fn run_restore(options: RestoreOptions) -> Result<(), String> {
     let outcome =
         store::restore(&record.id, options.destination.as_deref()).map_err(|e| e.to_string())?;
     if let Some(error) = &outcome.warning {
-        eprintln!("sure-rm: warning: restored but failed to remove metadata: {error}");
+        color::print_warning(format_args!(
+            "restored but failed to remove metadata: {error}"
+        ));
     }
     println!("restored {}", outcome.path.display());
     Ok(())
@@ -341,10 +349,10 @@ fn run_purge(options: PurgeOptions) -> Result<(), String> {
 fn purge_record(record: &TrashRecord) -> Result<(), String> {
     let outcome = store::purge_record_data(record).map_err(|e| e.to_string())?;
     if let Some(error) = &outcome.warning {
-        eprintln!(
-            "sure-rm: warning: purged {} but failed to remove metadata: {error}",
+        color::print_warning(format_args!(
+            "purged {} but failed to remove metadata: {error}",
             record.id
-        );
+        ));
     }
     println!("purged {}", record.id);
     Ok(())
@@ -390,7 +398,8 @@ fn resolve_mode(requested: RequestedMode) -> EffectiveMode {
 fn confirm(prompt: &str) -> Result<bool, String> {
     use std::io::{self, Write};
 
-    eprint!("{prompt} [y/N] ");
+    let p = color::stderr_painter();
+    eprint!("{} ", p.emphasis(format_args!("{prompt} [y/N]")));
     io::stderr().flush().map_err(|e| e.to_string())?;
 
     let mut input = String::new();
@@ -403,9 +412,10 @@ fn confirm(prompt: &str) -> Result<bool, String> {
 }
 
 fn print_delete_result(result: DeleteResult) {
+    let p = color::stdout_painter();
     match result {
         DeleteResult::PermanentlyDeleted(path) => {
-            println!("deleted {}", path.display());
+            println!("{} {}", p.bad("deleted"), path.display());
         }
         DeleteResult::Trashed(record) => {
             let suffix = match record.outcome {
@@ -413,7 +423,8 @@ fn print_delete_result(result: DeleteResult) {
                 MoveOutcome::SiblingFallback => " (same-directory fallback)",
             };
             println!(
-                "trashed {} -> {}{}",
+                "{} {} -> {}{}",
+                p.good("trashed"),
                 record.original_path.display(),
                 record.trashed_path.display(),
                 suffix
@@ -421,6 +432,12 @@ fn print_delete_result(result: DeleteResult) {
         }
     }
 }
+
+/// Crate-wide lock for tests that mutate process-global environment variables.
+/// Every `unsafe { env::set_var / remove_var }` call in any test module must
+/// hold this lock to prevent data races across the test harness's thread pool.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {

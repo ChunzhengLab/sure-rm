@@ -464,8 +464,15 @@ fn parse_unlink(args: Vec<OsString>) -> Result<Command, String> {
 }
 
 fn parse_delete(args: Vec<OsString>) -> Result<Command, String> {
+    parse_delete_with_mode(RequestedMode::from_env()?, args)
+}
+
+fn parse_delete_with_mode(
+    default_mode: RequestedMode,
+    args: Vec<OsString>,
+) -> Result<Command, String> {
     let mut options = DeleteOptions {
-        mode: RequestedMode::from_env()?,
+        mode: default_mode,
         ..DeleteOptions::default()
     };
     let mut parsing_options = true;
@@ -544,7 +551,7 @@ fn parse_delete(args: Vec<OsString>) -> Result<Command, String> {
 mod tests {
     use super::{
         Command, RequestedMode, SureBypass, build_sure_bypass, filter_passthrough_args,
-        invoked_as_unlink, parse_delete, parse_unlink,
+        invoked_as_unlink, parse_delete_with_mode, parse_unlink,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -555,7 +562,8 @@ mod tests {
 
     #[test]
     fn parses_combined_short_flags() {
-        let Command::Delete(options) = parse_delete(os(&["-rfv", "target", "other"])).unwrap()
+        let Command::Delete(options) =
+            parse_delete_with_mode(RequestedMode::Auto, os(&["-rfv", "target", "other"])).unwrap()
         else {
             panic!("expected delete command");
         };
@@ -568,7 +576,9 @@ mod tests {
 
     #[test]
     fn i_overrides_previous_f() {
-        let Command::Delete(options) = parse_delete(os(&["-fi", "target"])).unwrap() else {
+        let Command::Delete(options) =
+            parse_delete_with_mode(RequestedMode::Auto, os(&["-fi", "target"])).unwrap()
+        else {
             panic!("expected delete command");
         };
 
@@ -578,7 +588,9 @@ mod tests {
 
     #[test]
     fn parses_d_x_p_flags() {
-        let Command::Delete(options) = parse_delete(os(&["-dxpv", "target"])).unwrap() else {
+        let Command::Delete(options) =
+            parse_delete_with_mode(RequestedMode::Auto, os(&["-dxpv", "target"])).unwrap()
+        else {
             panic!("expected delete command");
         };
 
@@ -590,9 +602,11 @@ mod tests {
 
     #[test]
     fn parses_mode_long_option() {
-        let Command::Delete(options) =
-            parse_delete(os(&["--mode", "interactive", "target"])).unwrap()
-        else {
+        let Command::Delete(options) = parse_delete_with_mode(
+            RequestedMode::Auto,
+            os(&["--mode", "interactive", "target"]),
+        )
+        .unwrap() else {
             panic!("expected delete command");
         };
 
@@ -602,7 +616,8 @@ mod tests {
 
     #[test]
     fn parses_mode_equals_syntax() {
-        let Command::Delete(options) = parse_delete(os(&["--mode=batch", "target"])).unwrap()
+        let Command::Delete(options) =
+            parse_delete_with_mode(RequestedMode::Auto, os(&["--mode=batch", "target"])).unwrap()
         else {
             panic!("expected delete command");
         };
@@ -621,7 +636,7 @@ mod tests {
 
     #[test]
     fn w_flag_returns_error() {
-        let error = parse_delete(os(&["-W", "target"])).unwrap_err();
+        let error = parse_delete_with_mode(RequestedMode::Auto, os(&["-W", "target"])).unwrap_err();
         assert!(error.contains("restore"));
     }
 

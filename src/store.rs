@@ -598,10 +598,8 @@ pub fn purge_expired_records() -> io::Result<ExpiredPurgeResult> {
 #[cfg(test)]
 mod tests {
     use super::{hex_decode_bytes, hex_encode_bytes, normalize_absolute_path};
+    use crate::ENV_LOCK;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn hex_round_trip() {
