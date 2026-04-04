@@ -62,6 +62,10 @@ fn run(command: Command) -> Result<(), String> {
             print!("{}", cli::subcommand_usage(topic));
             Ok(())
         }
+        Command::Version => {
+            println!("sure-rm {}", cli::version());
+            Ok(())
+        }
     }
 }
 
@@ -329,6 +333,18 @@ fn run_restore(options: RestoreOptions) -> Result<(), String> {
 fn run_purge(options: PurgeOptions) -> Result<(), String> {
     if options.all {
         let records = store::load_records().map_err(|e| e.to_string())?;
+        if records.is_empty() {
+            println!("sure-rm trash is empty, nothing to purge");
+            return Ok(());
+        }
+        let prompt = format!(
+            "permanently delete all {} trash entr{}?",
+            records.len(),
+            if records.len() == 1 { "y" } else { "ies" }
+        );
+        if !confirm(&prompt)? {
+            return Ok(());
+        }
         for record in records {
             purge_record(&record)?;
         }

@@ -22,6 +22,7 @@ pub enum Command {
     Purge(PurgeOptions),
     Unlink(UnlinkOptions),
     Help(HelpTopic),
+    Version,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +127,7 @@ fn parse_command(leading_mode: Vec<OsString>, rest: Vec<OsString>) -> Result<Com
     }
 
     match classify_first_arg(rest.first()) {
+        FirstArg::Subcommand("--version") => Ok(Command::Version),
         FirstArg::Subcommand("help" | "--help" | "-h") => Ok(Command::Help(HelpTopic::General)),
         FirstArg::Subcommand("unlink") => parse_unlink(rest[1..].to_vec()),
         FirstArg::Subcommand("list") => parse_list(rest[1..].to_vec()),
@@ -172,7 +174,7 @@ enum FirstArg<'a> {
 
 fn classify_first_arg(arg: Option<&OsString>) -> FirstArg<'_> {
     match arg.and_then(|a| a.to_str()) {
-        Some(name @ ("help" | "--help" | "-h" | "list" | "restore" | "purge" | "unlink")) => {
+        Some(name @ ("help" | "--help" | "-h" | "--version" | "list" | "restore" | "purge" | "unlink")) => {
             FirstArg::Subcommand(name)
         }
         _ => FirstArg::DeleteOrPath,
@@ -295,21 +297,26 @@ Usage:
   sure-rm unlink [--] <PATH>
 
 Options:
-  -r, -R      allow directory removal
-  -d          allow removing an empty directory without -r
-  -p          permanently delete instead of moving into sure-rm trash
-  -x          refuse recursive operations that would cross filesystem boundaries
-  -f          ignore missing files and disable per-path prompts
-  -i          ask before every removal
-  -I          ask once before removing many paths or any directory
-  --mode      auto, interactive, or batch
-  -s, --sure  bypass sure-rm and exec the system rm/unlink command
-  -v          print where the entry was moved
-  -h, --help  show this help
+  -r, -R         allow directory removal
+  -d             allow removing an empty directory without -r
+  -p             permanently delete instead of moving into sure-rm trash
+  -x             refuse recursive operations that would cross filesystem boundaries
+  -f             ignore missing files and disable per-path prompts
+  -i             ask before every removal
+  -I             ask once before removing many paths or any directory
+  --mode         auto, interactive, or batch
+  -s, --sure     bypass sure-rm and exec the system rm/unlink command
+  -v             print where the entry was moved
+  -h, --help     show this help
+  --version      show version
 
 ",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 pub fn subcommand_usage(topic: HelpTopic) -> String {
